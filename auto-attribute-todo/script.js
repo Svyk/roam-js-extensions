@@ -1,4 +1,16 @@
-/* auto-attribute-todo v1.2.0
+/* auto-attribute-todo v1.2.1
+ *
+ * v1.2.1 — TWO FIXES:
+ * 1. ALWAYS emit dropdown when project is set (was: only when LLM returned 2+
+ *    candidates). Single AI pick now writes
+ *    `BT_attrProject:: {{or: [[AIpick]] | +attr:[[BT_attrProject]]}}`
+ *    so the user gets a dropdown of all historical project values to pick from.
+ *    Multi-candidate keeps the inline list + attr: pool.
+ * 2. JS-based clean-text fallback. The LLM's `cleaned_text` field was
+ *    inconsistent (Haiku skipped it ~half the time). Now there's a
+ *    deterministic regex cleaner that runs after the LLM attempt, stripping
+ *    date words when BT_attrDue is set, urgency words when priority=High,
+ *    and "for/with [Alias]" patterns when the person is tagged in notes.
  *
  * v1.2.0 — top-3 project candidates emitted as `{{or: [[A]] | [[B]] | [[C]]}}`
  * dropdown syntax in BT_attrProject. Universal Selector extension (if installed)
@@ -60,7 +72,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.2.0";
+  const VERSION = "1.2.1";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -418,27 +430,85 @@ ${entityListLines}`;
   }
 
   /* ---------- insertion ---------- */
-  // Build BT_attrProject value — flat [[Project]] for single pick or
-  // {{or: [[A]] | [[B]] | [[C]]}} dropdown for ranked candidates.
+  // Build BT_attrProject value:
+  // - dropdown OFF: flat [[Project]]
+  // - dropdown ON, single pick: {{or: [[Top1]] | +attr:[[BT_attrProject]]}}
+  // - dropdown ON, multi pick:  {{or: [[T1]] | [[T2]] | [[T3]] | +attr:[[BT_attrProject]]}}
+  // The +attr:[[BT_attrProject]] tail makes Universal Selector pull all
+  // historical project values for the dropdown — so even a single AI pick
+  // gets a usable dropdown.
   function formatProjectValue(attrs) {
     if (!attrs.project) return null;
-    const top3 = Array.isArray(attrs.top_3_projects)
-      ? attrs.top_3_projects.filter(p => typeof p === "string" && p.trim().length > 0)
-      : [];
-    // If dropdown disabled, or top_3 not provided / single candidate, use flat.
-    if (!state.settings.useDropdown || top3.length < 2) {
+    if (!state.settings.useDropdown) {
       return `[[${attrs.project}]]`;
     }
-    // Dedupe + cap at 3
-    const seen = new Set();
-    const unique = top3.filter(p => {
-      if (seen.has(p)) return false;
-      seen.add(p);
-      return true;
-    }).slice(0, 3);
-    if (unique.length < 2) return `[[${attrs.project}]]`;
-    const options = unique.map(p => `[[${p}]]`).join(" | ");
-    return `{{or: ${options}}}`;
+    // Always lead with attrs.project (the AI's #1 pick)
+    const candidates = [attrs.project];
+    if (Array.isArray(attrs.top_3_projects)) {
+      for (const p of attrs.top_3_projects) {
+        if (typeof p === "string" && p.trim().length > 0 && !candidates.includes(p.trim())) {
+          candidates.push(p.trim());
+        }
+      }
+    }
+    const capped = candidates.slice(0, 3);
+    const options = capped.map(p => `[[${p}]]`).join(" | ");
+    return `{{or: ${options} | +attr:[[BT_attrProject]]}}`;
+  }
+
+  /* JS-based clean-text — regex fallback when LLM didn't fill cleaned_text.
+   * Runs AFTER the LLM has attributed. Strips:
+   *  - date words when BT_attrDue is set
+   *  - urgency words when priority=High
+   *  - "for/with [Alias]" when an aliased person is tagged in notes
+   *  - common filler phrases ("need to", "should") */
+  function cleanTodoTextJS(originalText, attrs, entitiesData) {
+    if (!originalText) return null;
+    let cleaned = originalText;
+
+    // Strip date words if due was set
+    if (Number.isInteger(attrs?.due_offset_days)) {
+      const datePatterns = [
+        /\s*\b(today|tomorrow|tonight|yesterday)\b/gi,
+        /\s*\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi,
+        /\s*\b(mon|tues?|wed|thurs?|fri|sat|sun)\b/gi,
+        /\s*\b(this|next|last)\s+(week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi,
+        /\s*\bby\s+(today|tomorrow|EOD|EOW|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi,
+        /\s*\bin\s+\d+\s+(days?|weeks?|months?)\b/gi,
+        /\s*\bon\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi,
+      ];
+      for (const re of datePatterns) cleaned = cleaned.replace(re, "");
+    }
+
+    // Strip urgency words if priority=High
+    if (attrs?.priority === "High") {
+      cleaned = cleaned.replace(/\s*\b(urgent|asap|important|must|critical|priority|now!?)\b/gi, "");
+    }
+
+    // Strip "for/with/to [Alias]" when person tagged in notes via [[Canonical]]
+    if (attrs?.notes && Array.isArray(entitiesData)) {
+      for (const ent of entitiesData) {
+        if (!attrs.notes.includes(`[[${ent.name}]]`)) continue;
+        for (const alias of ent.aliases || []) {
+          const escAlias = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          // "for Lori", "with Lori", "to Lori", "Lori's"
+          cleaned = cleaned.replace(new RegExp(`\\s*\\b(for|with|to)\\s+${escAlias}('s)?\\b`, "gi"), "");
+          cleaned = cleaned.replace(new RegExp(`\\s*\\b${escAlias}'s\\b`, "gi"), "");
+        }
+      }
+    }
+
+    // Strip common filler
+    cleaned = cleaned.replace(/\s*\b(need to|should|have to)\b/gi, "");
+
+    // Collapse whitespace + trim
+    cleaned = cleaned.replace(/\s+/g, " ").trim();
+
+    // Sanity guards
+    if (!cleaned.includes("{{[[TODO]]}}")) return null;
+    if (cleaned.length < state.settings.minTextLength) return null;
+    if (cleaned === originalText.trim()) return null;
+    return cleaned;
   }
 
   async function insertAttrs(parentUid, attrs, originalText) {
@@ -464,31 +534,37 @@ ${entityListLines}`;
       });
     }
 
-    // OPTIONAL: clean the parent TODO text to remove hints now captured in attrs.
-    // Conservative guards: must start with {{[[TODO]]}}, must be shorter than
-    // original, must be at least minTextLength, and must differ from original.
-    if (
-      state.settings.cleanTodoText &&
-      attrs.cleaned_text &&
-      typeof attrs.cleaned_text === "string"
-    ) {
-      const cleaned = attrs.cleaned_text.trim();
-      const looksValid =
-        cleaned.includes("{{[[TODO]]}}") &&
-        cleaned.length >= state.settings.minTextLength &&
-        cleaned.length < (originalText || "").length &&
-        cleaned !== originalText;
-      if (looksValid) {
+    // Clean the parent TODO text to remove hints now captured in attrs.
+    // Two-stage: try LLM-suggested cleaned_text first (richer rewrites),
+    // fall back to deterministic JS regex cleaner.
+    if (state.settings.cleanTodoText) {
+      let cleaned = null;
+      // Stage 1: LLM cleaned_text
+      if (attrs.cleaned_text && typeof attrs.cleaned_text === "string") {
+        const llmCleaned = attrs.cleaned_text.trim();
+        if (
+          llmCleaned.includes("{{[[TODO]]}}") &&
+          llmCleaned.length >= state.settings.minTextLength &&
+          llmCleaned.length < (originalText || "").length &&
+          llmCleaned !== originalText.trim()
+        ) {
+          cleaned = llmCleaned;
+        }
+      }
+      // Stage 2: JS regex fallback
+      if (!cleaned) {
+        const entitiesData = getAllEntitiesWithAliases();
+        cleaned = cleanTodoTextJS(originalText, attrs, entitiesData);
+      }
+      if (cleaned) {
         try {
           await window.roamAlphaAPI.data.block.update({
             block: { uid: parentUid, string: cleaned },
           });
-          log("info", `cleaned title [${parentUid}]: ${(originalText.length - cleaned.length)} chars dropped`);
+          log("info", `cleaned title [${parentUid}]: ${originalText.length - cleaned.length} chars dropped`);
         } catch (e) {
           log("warn", `cleaned-text update failed [${parentUid}]`, e);
         }
-      } else if (cleaned) {
-        log("debug", `skipped cleaned_text (failed guards)`, { cleaned, originalText });
       }
     }
   }
@@ -679,7 +755,7 @@ ${entityListLines}`;
           const m = s.match(/^BT_attrProject::\s*\[\[(.+?)\]\]\s*$/);
           if (!m) { skipped++; continue; }
           const project = m[1];
-          const newStr = `BT_attrProject:: {{or: [[${project}]]}}`;
+          const newStr = `BT_attrProject:: {{or: [[${project}]] | +attr:[[BT_attrProject]]}}`;
           await window.roamAlphaAPI.data.block.update({
             block: { uid, string: newStr },
           });
