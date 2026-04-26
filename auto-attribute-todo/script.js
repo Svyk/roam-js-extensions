@@ -1,4 +1,11 @@
-/* auto-attribute-todo v1.1.2
+/* auto-attribute-todo v1.2.0
+ *
+ * v1.2.0 — top-3 project candidates emitted as `{{or: [[A]] | [[B]] | [[C]]}}`
+ * dropdown syntax in BT_attrProject. Universal Selector extension (if installed)
+ * renders this as a filterable dropdown — one click to override the AI's pick.
+ * Roam has a native `{{or:}}` fallback if Universal Selector isn't installed.
+ * Single-candidate cases keep the flat `[[Project]]` format (no dropdown clutter).
+ * Bulk-convert command added for upgrading existing flat BT_attrProject blocks.
  *
  * v1.1.2 — clean redundant hints from the TODO title. After BT_attr children
  * are assigned, if the title contained "tomorrow"/date words, person aliases,
@@ -53,7 +60,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.1.2";
+  const VERSION = "1.2.0";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -72,6 +79,7 @@
     contextChildren: true,       // include block's children (subtasks, notes)
     contextSiblings: true,       // include sibling blocks (other items in same list)
     cleanTodoText: true,         // rewrite TODO title to remove hints captured in attrs
+    useDropdown: true,           // emit BT_attrProject as {{or:}} dropdown of top-3 candidates
   };
 
   const state = {
@@ -401,9 +409,33 @@ ${entityListLines}`;
   }
 
   /* ---------- insertion ---------- */
+  // Build BT_attrProject value — flat [[Project]] for single pick or
+  // {{or: [[A]] | [[B]] | [[C]]}} dropdown for ranked candidates.
+  function formatProjectValue(attrs) {
+    if (!attrs.project) return null;
+    const top3 = Array.isArray(attrs.top_3_projects)
+      ? attrs.top_3_projects.filter(p => typeof p === "string" && p.trim().length > 0)
+      : [];
+    // If dropdown disabled, or top_3 not provided / single candidate, use flat.
+    if (!state.settings.useDropdown || top3.length < 2) {
+      return `[[${attrs.project}]]`;
+    }
+    // Dedupe + cap at 3
+    const seen = new Set();
+    const unique = top3.filter(p => {
+      if (seen.has(p)) return false;
+      seen.add(p);
+      return true;
+    }).slice(0, 3);
+    if (unique.length < 2) return `[[${attrs.project}]]`;
+    const options = unique.map(p => `[[${p}]]`).join(" | ");
+    return `{{or: ${options}}}`;
+  }
+
   async function insertAttrs(parentUid, attrs, originalText) {
     const blocks = [];
-    if (attrs.project) blocks.push(`BT_attrProject:: [[${attrs.project}]]`);
+    const projectValue = formatProjectValue(attrs);
+    if (projectValue) blocks.push(`BT_attrProject:: ${projectValue}`);
     if (Number.isInteger(attrs.due_offset_days))
       blocks.push(`BT_attrDue:: ${formatRoamDate(attrs.due_offset_days)}`);
     if (attrs.priority) blocks.push(`BT_attrPriority:: ${attrs.priority}`);
@@ -613,6 +645,43 @@ ${entityListLines}`;
     add("Auto-Attribute: toggle clean-text (rewrite TODO title)", () => {
       state.settings.cleanTodoText = !state.settings.cleanTodoText;
       log("info", `cleanTodoText: ${state.settings.cleanTodoText}`);
+    });
+    add("Auto-Attribute: toggle dropdown mode (BT_attrProject)", () => {
+      state.settings.useDropdown = !state.settings.useDropdown;
+      log("info", `useDropdown: ${state.settings.useDropdown} — ${state.settings.useDropdown ? "new TODOs will get {{or:}} dropdown" : "new TODOs will get flat [[Project]]"}`);
+    });
+    add("Auto-Attribute: convert existing flat BT_attrProject to dropdown (bulk)", async () => {
+      if (!confirm("Convert ALL existing BT_attrProject:: [[X]] blocks to {{or:}} dropdown format?\n\nThis lets you pick from your project history via Universal Selector. Reversible by manual edit. Continue?")) return;
+      try {
+        const rows = window.roamAlphaAPI.data.q(`
+          [:find ?uid ?s
+           :where
+           [?b :block/uid ?uid]
+           [?b :block/string ?s]
+           [(clojure.string/starts-with? ?s "BT_attrProject:: [[")]]
+        `);
+        let converted = 0, skipped = 0;
+        for (const row of rows) {
+          const uid = row[0];
+          const s = row[1];
+          // skip if already a dropdown
+          if (s.includes("{{or:")) { skipped++; continue; }
+          // extract [[Project]] from string after "BT_attrProject:: "
+          const m = s.match(/^BT_attrProject::\s*\[\[(.+?)\]\]\s*$/);
+          if (!m) { skipped++; continue; }
+          const project = m[1];
+          const newStr = `BT_attrProject:: {{or: [[${project}]]}}`;
+          await window.roamAlphaAPI.data.block.update({
+            block: { uid, string: newStr },
+          });
+          converted++;
+        }
+        log("info", `bulk convert complete — ${converted} converted, ${skipped} skipped`);
+        alert(`Converted ${converted} BT_attrProject blocks to dropdown format.\n${skipped} skipped (already dropdown or unparseable).`);
+      } catch (e) {
+        log("error", "bulk convert failed", e);
+        alert("Bulk convert failed: " + e.message);
+      }
     });
     add("Auto-Attribute: show stats", () => {
       log("info", "stats", {
