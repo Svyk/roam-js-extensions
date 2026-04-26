@@ -1,4 +1,15 @@
-/* auto-attribute-todo v1.2.1
+/* auto-attribute-todo v1.3.0
+ *
+ * v1.3.0 — TWO new features:
+ *   (a) Auto-maintained [[Active Projects]] hub page that mirrors current
+ *       Project Status:: Active set. Dropdown source switches to this hub
+ *       (+[[Active Projects]]) so the dropdown ALWAYS reflects active state
+ *       — new projects appear immediately, completed ones disappear.
+ *       Sync runs on each scan cycle (~15 min) and on cmd palette demand.
+ *   (b) Auto-create projects when AI suggests one (off by default — toggle
+ *       via cmd palette). Conservative: confidence >= 0.7 required, max 5
+ *       new projects per day. New page gets Project Status:: Active block
+ *       and an Aliases:: block seeded from the TODO text. Logged loudly.
  *
  * v1.2.1 — TWO FIXES:
  * 1. ALWAYS emit dropdown when project is set (was: only when LLM returned 2+
@@ -72,7 +83,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.2.1";
+  const VERSION = "1.3.0";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -92,6 +103,11 @@
     contextSiblings: true,       // include sibling blocks (other items in same list)
     cleanTodoText: true,         // rewrite TODO title to remove hints captured in attrs
     useDropdown: true,           // emit BT_attrProject as {{or:}} dropdown of top-3 candidates
+    activeProjectsHub: "Active Projects",  // page that mirrors all Project Status:: Active pages
+    syncHubOnScan: true,         // re-sync hub page on each safety scan
+    autoCreateProjects: false,   // create new project pages when AI suggests one (opt-in)
+    autoCreateMinConfidence: 0.7, // AI must be at least this confident to auto-create
+    autoCreateDailyCap: 5,       // max new project pages per day
   };
 
   const state = {
@@ -102,6 +118,7 @@
     callsResetDate: new Date().toDateString(),
     pullWatchUnsub: null,
     scanTimer: null,
+    projectsCreatedToday: 0,     // throttle for auto-create
   };
 
   /* ---------- helpers ---------- */
@@ -130,6 +147,7 @@
     const today = new Date().toDateString();
     if (state.callsResetDate !== today) {
       state.callsToday = 0;
+      state.projectsCreatedToday = 0;
       state.callsResetDate = today;
     }
   }
@@ -209,6 +227,131 @@
   // Backward-compat shim — some other code might still call getActiveProjects()
   function getActiveProjects() {
     return getActiveProjectsWithAliases().map(p => p.name);
+  }
+
+  /* ---------- Active Projects hub page sync ----------
+   * Maintains [[Active Projects]] — a page whose direct children are
+   * [[Project Name]] links, one per page tagged Project Status:: Active.
+   * Universal Selector reads the children to populate the BT_attrProject
+   * dropdown via `+[[Active Projects]]` source. */
+  async function syncActiveProjectsHub() {
+    const hubTitle = state.settings.activeProjectsHub;
+    let hubUid = window.roamAlphaAPI.q(
+      `[:find ?u . :where [?p :node/title "${hubTitle}"] [?p :block/uid ?u]]`
+    );
+    if (!hubUid) {
+      hubUid = window.roamAlphaAPI.util.generateUID();
+      try {
+        await window.roamAlphaAPI.data.page.create({
+          page: { title: hubTitle, uid: hubUid },
+        });
+        // Add a header comment so user knows what this page is
+        await window.roamAlphaAPI.data.block.create({
+          location: { "parent-uid": hubUid, order: 0 },
+          block: { string: "_Auto-maintained by auto-attribute-todo. Each child is one [[Project Status:: Active]] page. Used as the BT_attrProject dropdown source via Universal Selector. Manually editing children is OK — they'll get re-synced on next scan._" },
+        });
+      } catch (e) {
+        log("warn", `failed to create hub page [[${hubTitle}]]`, e);
+        return null;
+      }
+    }
+    try {
+      const projects = getActiveProjectsWithAliases().map(p => `[[${p.name}]]`);
+      const projectSet = new Set(projects);
+      const data = window.roamAlphaAPI.data.pull(
+        "[{:block/children [:block/uid :block/string]}]",
+        [":block/uid", hubUid]
+      );
+      const children = (data?.[":block/children"] || []);
+      const existingMap = new Map();  // string → uid
+      for (const c of children) {
+        existingMap.set((c[":block/string"] || "").trim(), c[":block/uid"]);
+      }
+      let added = 0, removed = 0;
+      // Add missing projects
+      for (const proj of projects) {
+        if (!existingMap.has(proj)) {
+          await window.roamAlphaAPI.data.block.create({
+            location: { "parent-uid": hubUid, order: "last" },
+            block: { string: proj },
+          });
+          added++;
+        }
+      }
+      // Remove children that aren't active anymore (preserve the header comment)
+      for (const [str, uid] of existingMap) {
+        if (str.startsWith("_Auto-maintained")) continue;
+        if (!projectSet.has(str)) {
+          await window.roamAlphaAPI.data.block.delete({ block: { uid } });
+          removed++;
+        }
+      }
+      if (added || removed) {
+        log("info", `[[${hubTitle}]] synced — +${added} -${removed}`);
+      }
+      return hubUid;
+    } catch (e) {
+      log("warn", `hub sync failed`, e);
+      return hubUid;
+    }
+  }
+
+  /* ---------- Auto-create new project page ----------
+   * Called when AI returned project=null but suggested_new_project name.
+   * Conservative: respects daily cap + confidence threshold. */
+  async function autoCreateProject(name, todoText, attrs) {
+    if (!state.settings.autoCreateProjects) return null;
+    if ((attrs?.confidence ?? 0) < state.settings.autoCreateMinConfidence) {
+      log("info", `auto-create skipped (confidence ${attrs?.confidence?.toFixed(2)} < ${state.settings.autoCreateMinConfidence})`);
+      return null;
+    }
+    if (state.projectsCreatedToday >= state.settings.autoCreateDailyCap) {
+      log("warn", `auto-create cap reached (${state.settings.autoCreateDailyCap}/day)`);
+      return null;
+    }
+    if (!name || typeof name !== "string" || name.trim().length < 3) return null;
+    const safeName = name.trim();
+    // Skip if page already exists
+    const existing = window.roamAlphaAPI.q(
+      `[:find ?u . :where [?p :node/title "${safeName.replaceAll('"', '\\"')}"] [?p :block/uid ?u]]`
+    );
+    if (existing) {
+      log("info", `auto-create skipped: [[${safeName}]] already exists`);
+      return safeName;
+    }
+    try {
+      const newUid = window.roamAlphaAPI.util.generateUID();
+      await window.roamAlphaAPI.data.page.create({
+        page: { title: safeName, uid: newUid },
+      });
+      // Add Project Status:: Active and Aliases:: blocks
+      await window.roamAlphaAPI.data.block.create({
+        location: { "parent-uid": newUid, order: 0 },
+        block: { string: `_Auto-created by auto-attribute-todo on ${formatRoamDate(0)} from TODO: "${todoText.slice(0, 80)}"_` },
+      });
+      await window.roamAlphaAPI.data.block.create({
+        location: { "parent-uid": newUid, order: 1 },
+        block: { string: "Project Status:: Active" },
+      });
+      // Suggest aliases from the suggested name (lowercase, individual words)
+      const suggestedAliases = safeName.toLowerCase()
+        .split(/\s+/)
+        .filter(w => w.length > 3 && !["the", "and", "for", "with"].includes(w))
+        .slice(0, 3)
+        .join(", ");
+      if (suggestedAliases) {
+        await window.roamAlphaAPI.data.block.create({
+          location: { "parent-uid": newUid, order: 2 },
+          block: { string: `Aliases:: ${suggestedAliases}` },
+        });
+      }
+      state.projectsCreatedToday++;
+      log("warn", `🆕 auto-created project [[${safeName}]] (${state.projectsCreatedToday}/${state.settings.autoCreateDailyCap} today). Verify the page is correct.`);
+      return safeName;
+    } catch (e) {
+      log("error", `auto-create failed for [[${safeName}]]`, e);
+      return null;
+    }
   }
 
   // Returns ALL pages with an Aliases:: block, regardless of project status.
@@ -307,6 +450,7 @@ Schema:
  "energy": "Low"|"Medium"|"High",
  "context": "@work"|"@home"|"@computer"|"@errands"|null,
  "top_3_projects": [<top pick (must equal "project")>, <2nd best>, <3rd best>],
+ "suggested_new_project": "<IF no existing project fits well, suggest a SHORT (2-5 word) project name that would be appropriate. Examples: 'Personnel Reviews', 'Sanitation Process Audits', 'Q3 Compliance Drive'. Only suggest when project=null AND the TODO seems to belong to a thematic project that doesn't exist yet. Set null otherwise.>",
  "due_offset_days": <int 0-30; 0=today, 1=tomorrow>,
  "notes": "<ONE LINE summary of what this task is for, WHO it's for if mentioned in parent context, and WHY it exists. Pull names of people, meetings, projects from the breadcrumb path or siblings. E.g. 'For Lori per 1:1 meeting on EMP swab review' or 'Follow-up from Mon meeting with Tracy on QC trends'. If no rich context, leave as null and the script will use a default.>",
  "confidence": <0-1>,
@@ -327,7 +471,7 @@ Context-aware project matching:
 - Use child blocks: if user already wrote a sub-note saying "for Lori", pick the Lori-aliased project.
 - A person's name matching a project's alias (e.g. "Lori" → "EMP Risk Matrix") is a strong signal.
 - Always return the CANONICAL project name from the list below, never the alias.
-- If nothing fits, set "project": null AND "top_3_projects": null.
+- If nothing fits, set "project": null AND "top_3_projects": null. ALSO try to suggest a "suggested_new_project" name (2-5 words, thematic) if the TODO clearly belongs to a project category that doesn't exist yet. The script may auto-create that page if auto-create is enabled.
 
 top_3_projects ranking (NEW in v1.2.0 — populates the BT_attrProject dropdown):
 - ALWAYS rank top-3 most-relevant active projects when "project" is non-null.
@@ -453,7 +597,10 @@ ${entityListLines}`;
     }
     const capped = candidates.slice(0, 3);
     const options = capped.map(p => `[[${p}]]`).join(" | ");
-    return `{{or: ${options} | +attr:[[BT_attrProject]]}}`;
+    // Source pool: [[Active Projects]] hub (current active set).
+    // Falls back to attr:[[BT_attrProject]] if hub doesn't exist yet.
+    const hubTitle = state.settings.activeProjectsHub;
+    return `{{or: ${options} | +[[${hubTitle}]]}}`;
   }
 
   /* JS-based clean-text — regex fallback when LLM didn't fill cleaned_text.
@@ -627,6 +774,14 @@ ${entityListLines}`;
       await logToRoam(uid, null, "no result");
       return;
     }
+    // Auto-create project if AI returned null project but suggested a new one
+    if (!attrs.project && attrs.suggested_new_project) {
+      const created = await autoCreateProject(attrs.suggested_new_project, text, attrs);
+      if (created) {
+        attrs.project = created;
+        attrs.top_3_projects = [created];
+      }
+    }
     if (state.settings.requireConfirmation) {
       log("info", "(suggestion-only mode) attrs:", attrs);
       await logToRoam(uid, attrs, "suggestion-only");
@@ -651,6 +806,9 @@ ${entityListLines}`;
   function startScan() {
     state.scanTimer = setInterval(() => {
       if (!state.settings.enabled) return;
+      if (state.settings.syncHubOnScan) {
+        syncActiveProjectsHub().catch(e => log("warn", "hub sync failed", e));
+      }
       const uids = findAllTodos();
       let queued = 0;
       const budget = state.settings.scanBudgetPerCycle;
@@ -734,6 +892,14 @@ ${entityListLines}`;
     add("Auto-Attribute: toggle dropdown mode (BT_attrProject)", () => {
       state.settings.useDropdown = !state.settings.useDropdown;
       log("info", `useDropdown: ${state.settings.useDropdown} — ${state.settings.useDropdown ? "new TODOs will get {{or:}} dropdown" : "new TODOs will get flat [[Project]]"}`);
+    });
+    add("Auto-Attribute: sync [[Active Projects]] hub now", async () => {
+      const uid = await syncActiveProjectsHub();
+      log("info", `hub sync done — uid=${uid}`);
+    });
+    add("Auto-Attribute: toggle auto-create projects", () => {
+      state.settings.autoCreateProjects = !state.settings.autoCreateProjects;
+      log("info", `autoCreateProjects: ${state.settings.autoCreateProjects} ${state.settings.autoCreateProjects ? "(min conf " + state.settings.autoCreateMinConfidence + ", cap " + state.settings.autoCreateDailyCap + "/day)" : ""}`);
     });
     add("Auto-Attribute: convert existing flat BT_attrProject to dropdown (bulk)", async () => {
       if (!confirm("Convert ALL existing BT_attrProject:: [[X]] blocks to {{or:}} dropdown format?\n\nThis lets you pick from your project history via Universal Selector. Reversible by manual edit. Continue?")) return;
@@ -831,6 +997,8 @@ ${entityListLines}`;
     registerCommands();
     startPullWatch();
     startScan();
+    // Initial hub sync (best-effort, non-blocking)
+    syncActiveProjectsHub().catch(e => log("warn", "initial hub sync failed", e));
     window[`${NAMESPACE}_state`] = state;
     log("info", `ready. ${state.processedToday.size} already processed today.`);
   }
