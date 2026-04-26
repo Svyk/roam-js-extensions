@@ -294,6 +294,7 @@ Schema:
  "priority": "Low"|"Medium"|"High",
  "energy": "Low"|"Medium"|"High",
  "context": "@work"|"@home"|"@computer"|"@errands"|null,
+ "top_3_projects": [<top pick (must equal "project")>, <2nd best>, <3rd best>],
  "due_offset_days": <int 0-30; 0=today, 1=tomorrow>,
  "notes": "<ONE LINE summary of what this task is for, WHO it's for if mentioned in parent context, and WHY it exists. Pull names of people, meetings, projects from the breadcrumb path or siblings. E.g. 'For Lori per 1:1 meeting on EMP swab review' or 'Follow-up from Mon meeting with Tracy on QC trends'. If no rich context, leave as null and the script will use a default.>",
  "confidence": <0-1>,
@@ -314,7 +315,15 @@ Context-aware project matching:
 - Use child blocks: if user already wrote a sub-note saying "for Lori", pick the Lori-aliased project.
 - A person's name matching a project's alias (e.g. "Lori" → "EMP Risk Matrix") is a strong signal.
 - Always return the CANONICAL project name from the list below, never the alias.
-- If nothing fits, set "project": null.
+- If nothing fits, set "project": null AND "top_3_projects": null.
+
+top_3_projects ranking (NEW in v1.2.0 — populates the BT_attrProject dropdown):
+- ALWAYS rank top-3 most-relevant active projects when "project" is non-null.
+- The first item MUST equal "project" (your top pick goes first).
+- 2nd and 3rd are reasonable alternatives the user might prefer.
+- If <3 projects are plausibly relevant, return as many as fit (down to 1).
+- DON'T pad with random projects — better to return [Top1, Top2] than [Top1, Top2, Junk].
+- Names MUST be exact canonical names from the active list (case-sensitive).
 
 Notes field — make it useful, NOT just restating the title:
 - Pull WHO the task is for (named in parent/sibling blocks). When you mention
