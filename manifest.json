@@ -6,7 +6,7 @@
   "scripts": [
     {
       "name": "auto-attribute-todo",
-      "version": "1.4.0",
+      "version": "1.5.0",
       "namespace": "auto-attr-todo",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/auto-attribute-todo/script.js",
       "description": "Auto-fills BT_attr* on new {{[[TODO]]}} blocks via LiveAI_API.",

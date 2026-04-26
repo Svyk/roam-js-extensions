@@ -1,4 +1,22 @@
-/* auto-attribute-todo v1.4.0
+/* auto-attribute-todo v1.5.0
+ *
+ * v1.5.0 — Phase 2: smarter project matching + correction learning:
+ *   (a) Strip the auto-maintained comment block from [[Active Projects]] hub —
+ *       Universal Selector was including it as a dropdown option. Hub now
+ *       only contains [[Project Name]] links, no description text.
+ *   (b) Graph-Jaccard pre-ranking: for each TODO, collect [[Page]] refs from
+ *       the block + breadcrumb. For each active project, collect refs from
+ *       its page + recent backlinks. Compute Jaccard similarity. Top-10
+ *       projects by score get a graph_score boost in the LLM prompt + a
+ *       "graph signal" comment so the LLM knows which projects are
+ *       structurally connected to this TODO. Smaller prompt, better recall.
+ *   (c) Correction learning: when user manually changes a BT_attrProject
+ *       value (via Universal Selector dropdown or manual edit), the script
+ *       detects (AIpick → userPick) via pull-watch, logs to
+ *       [[Auto-Attribute Corrections]] page. The last 10 corrections are
+ *       included as few-shot examples in the LLM prompt for future TODOs.
+ *       True RLHF-style learning loop. Survives page reload via localStorage
+ *       rehydration.
  *
  * v1.4.0 — FIVE refinements based on real-world usage:
  *   (a) Active Projects hub query was too loose — matched ANY block containing
@@ -97,7 +115,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.4.0";
+  const VERSION = "1.5.0";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -122,7 +140,10 @@
     autoCreateProjects: true,    // ON by default — toggle off via cmd palette
     autoCreateMinConfidence: 0.7,
     autoCreateDailyCap: 5,
-    activeProjectStatuses: ["Active", "Ongoing"],  // statuses that qualify for dropdown
+    activeProjectStatuses: ["Active", "Ongoing"],
+    correctionsPage: "Auto-Attribute Corrections",
+    fewShotCorrectionsCount: 10,  // how many recent corrections to include in LLM prompt
+    graphJaccardTopK: 10,         // how many graph-pre-ranked projects to send to LLM
   };
 
   const state = {
@@ -133,7 +154,8 @@
     callsResetDate: new Date().toDateString(),
     pullWatchUnsub: null,
     scanTimer: null,
-    projectsCreatedToday: 0,     // throttle for auto-create
+    projectsCreatedToday: 0,
+    trackedAttributions: {},     // {btProjUid: {todoUid, originalPick, todoText, watcherCb}}
   };
 
   /* ---------- helpers ---------- */
@@ -264,6 +286,201 @@
     return getActiveProjectsWithAliases().map(p => p.name);
   }
 
+  /* ---------- Graph-Jaccard project pre-ranking (Phase 2) ----------
+   * For each TODO, collect [[Page]] refs from block + breadcrumb.
+   * For each project page, collect refs from its descendants.
+   * Jaccard = |shared| / |union|. Top-K ranked projects go to the LLM
+   * with a "graph_score" hint so the LLM knows which are structurally
+   * related to this TODO. Catches context the LLM-only path misses. */
+  function collectTodoContextRefs(uid) {
+    try {
+      const data = window.roamAlphaAPI.data.pull(
+        `[:block/string
+          {:block/refs [:node/title]}
+          {:block/parents [{:block/refs [:node/title]} :block/string]}]`,
+        [":block/uid", uid]
+      );
+      const refs = new Set();
+      for (const r of (data?.[":block/refs"] || [])) {
+        if (r[":node/title"]) refs.add(r[":node/title"]);
+      }
+      for (const p of (data?.[":block/parents"] || [])) {
+        for (const r of (p[":block/refs"] || [])) {
+          if (r[":node/title"]) refs.add(r[":node/title"]);
+        }
+      }
+      return refs;
+    } catch (e) {
+      log("debug", "collectTodoContextRefs failed", e);
+      return new Set();
+    }
+  }
+
+  function collectProjectPageRefs(projectName) {
+    try {
+      const safeName = projectName.replaceAll('"', '\\"');
+      // All blocks ON the project page → their refs
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?title
+         :where
+         [?p :node/title "${safeName}"]
+         [?b :block/page ?p]
+         [?b :block/refs ?r]
+         [?r :node/title ?title]]
+      `);
+      return new Set(rows.flat());
+    } catch (e) {
+      log("debug", `collectProjectPageRefs failed for ${projectName}`, e);
+      return new Set();
+    }
+  }
+
+  function jaccard(setA, setB) {
+    if (setA.size === 0 || setB.size === 0) return 0;
+    let intersection = 0;
+    for (const x of setA) if (setB.has(x)) intersection++;
+    const union = setA.size + setB.size - intersection;
+    return union > 0 ? intersection / union : 0;
+  }
+
+  function rankProjectsByGraphSignal(todoUid, projects) {
+    const todoRefs = collectTodoContextRefs(todoUid);
+    if (todoRefs.size === 0) {
+      // No context refs — return projects as-is with score 0
+      return projects.map(p => ({ ...p, graphScore: 0 }));
+    }
+    return projects
+      .map(p => {
+        const projRefs = collectProjectPageRefs(p.name);
+        return { ...p, graphScore: jaccard(todoRefs, projRefs) };
+      })
+      .sort((a, b) => b.graphScore - a.graphScore);
+  }
+
+  /* ---------- Correction learning (Phase 2) ----------
+   * When user changes a BT_attrProject value, capture (AIpick → userPick).
+   * Store on [[Auto-Attribute Corrections]] page. Recent corrections become
+   * few-shot examples in the LLM prompt. */
+  function parseSelectedProjectFromBlockString(blockString) {
+    if (!blockString) return null;
+    // Match BT_attrProject:: {{or: [[X]] | ...}} OR BT_attrProject:: [[X]]
+    const m = blockString.match(/^BT_attrProject::\s*(?:\{\{or:\s*)?\[\[(.+?)\]\]/);
+    return m ? m[1] : null;
+  }
+
+  function persistTracking() {
+    // Strip non-serializable fields (watcherCb is a function)
+    const serializable = {};
+    for (const [k, v] of Object.entries(state.trackedAttributions)) {
+      serializable[k] = {
+        todoUid: v.todoUid,
+        originalPick: v.originalPick,
+        todoText: v.todoText,
+        registeredAt: v.registeredAt,
+      };
+    }
+    localStorage.setItem(sk("tracked-attributions"), JSON.stringify(serializable));
+  }
+
+  function loadTrackingFromStorage() {
+    try {
+      return JSON.parse(localStorage.getItem(sk("tracked-attributions")) || "{}");
+    } catch { return {}; }
+  }
+
+  async function logCorrection(btProjUid, info, newPick) {
+    try {
+      const corrTitle = state.settings.correctionsPage;
+      let pageUid = window.roamAlphaAPI.q(
+        `[:find ?u . :where [?p :node/title "${corrTitle}"] [?p :block/uid ?u]]`
+      );
+      if (!pageUid) {
+        pageUid = window.roamAlphaAPI.util.generateUID();
+        await window.roamAlphaAPI.data.page.create({
+          page: { title: corrTitle, uid: pageUid },
+        });
+      }
+      const ts = new Date().toISOString().slice(11, 19);
+      const safeText = (info.todoText || "").replace(/"/g, "'").slice(0, 100);
+      const entry = `${formatRoamDate(0)} ${ts} TODO ((${info.todoUid})) | AI: [[${info.originalPick}]] | User: [[${newPick}]] | text: "${safeText}"`;
+      await window.roamAlphaAPI.data.block.create({
+        location: { "parent-uid": pageUid, order: "last" },
+        block: { string: entry },
+      });
+      log("info", `📝 correction recorded: AI=${info.originalPick} → User=${newPick} (TODO ((${info.todoUid})))`);
+    } catch (e) {
+      log("warn", "logCorrection failed", e);
+    }
+  }
+
+  function registerCorrectionWatch(btProjUid, info) {
+    try {
+      const cb = (before, after) => {
+        const newStr = after?.[":block/string"] || "";
+        const newPick = parseSelectedProjectFromBlockString(newStr);
+        if (!newPick) return;
+        if (newPick === info.originalPick) return;
+        // Record correction once, then unwatch
+        logCorrection(btProjUid, info, newPick).catch(e => log("warn", "logCorrection async err", e));
+        try {
+          window.roamAlphaAPI.data.removePullWatch("[:block/string]", [":block/uid", btProjUid], cb);
+        } catch {}
+        delete state.trackedAttributions[btProjUid];
+        persistTracking();
+      };
+      window.roamAlphaAPI.data.addPullWatch("[:block/string]", [":block/uid", btProjUid], cb);
+      info.watcherCb = cb;
+    } catch (e) {
+      log("warn", "registerCorrectionWatch failed", e);
+    }
+  }
+
+  function trackAttribution(btProjUid, todoUid, originalPick, todoText) {
+    const info = {
+      todoUid, originalPick, todoText,
+      registeredAt: Date.now(),
+    };
+    state.trackedAttributions[btProjUid] = info;
+    persistTracking();
+    registerCorrectionWatch(btProjUid, info);
+  }
+
+  function rehydrateTracking() {
+    const stored = loadTrackingFromStorage();
+    let count = 0;
+    for (const [uid, info] of Object.entries(stored)) {
+      // Skip very old entries (>30 days) — likely stale
+      const ageMs = Date.now() - (info.registeredAt || 0);
+      if (ageMs > 30 * 24 * 3600 * 1000) continue;
+      state.trackedAttributions[uid] = info;
+      registerCorrectionWatch(uid, info);
+      count++;
+    }
+    persistTracking();
+    if (count > 0) log("info", `rehydrated ${count} correction watchers`);
+  }
+
+  function getRecentCorrections(limit) {
+    try {
+      const corrTitle = state.settings.correctionsPage;
+      const pageUid = window.roamAlphaAPI.q(
+        `[:find ?u . :where [?p :node/title "${corrTitle}"] [?p :block/uid ?u]]`
+      );
+      if (!pageUid) return [];
+      const data = window.roamAlphaAPI.data.pull(
+        "[{:block/children [:block/string :block/order]}]",
+        [":block/uid", pageUid]
+      );
+      const children = (data?.[":block/children"] || [])
+        .sort((a, b) => (a[":block/order"] || 0) - (b[":block/order"] || 0))
+        .map(c => c[":block/string"])
+        .filter(Boolean);
+      return children.slice(-limit);
+    } catch (e) {
+      return [];
+    }
+  }
+
   /* ---------- Active Projects hub page sync ----------
    * Maintains [[Active Projects]] — a page whose direct children are
    * [[Project Name]] links, one per page tagged Project Status:: Active.
@@ -280,11 +497,8 @@
         await window.roamAlphaAPI.data.page.create({
           page: { title: hubTitle, uid: hubUid },
         });
-        // Add a header comment so user knows what this page is
-        await window.roamAlphaAPI.data.block.create({
-          location: { "parent-uid": hubUid, order: 0 },
-          block: { string: "_Auto-maintained by auto-attribute-todo. Each child is one [[Project Status:: Active]] page. Used as the BT_attrProject dropdown source via Universal Selector. Manually editing children is OK — they'll get re-synced on next scan._" },
-        });
+        // No description block — Universal Selector includes ALL children as
+        // dropdown options. Page name + the project list itself is the doc.
       } catch (e) {
         log("warn", `failed to create hub page [[${hubTitle}]]`, e);
         return null;
@@ -313,9 +527,9 @@
           added++;
         }
       }
-      // Remove children that aren't active anymore (preserve the header comment)
+      // Remove children that aren't active anymore — INCLUDING legacy
+      // description blocks from older versions of this script.
       for (const [str, uid] of existingMap) {
-        if (str.startsWith("_Auto-maintained")) continue;
         if (!projectSet.has(str)) {
           await window.roamAlphaAPI.data.block.delete({ block: { uid } });
           removed++;
@@ -458,12 +672,27 @@
       return null;
     }
 
-    const projectsData = getActiveProjectsWithAliases();
-    const projectListLines = projectsData.map(p =>
-      p.aliases.length
-        ? `- "${p.name}" (aliases: ${p.aliases.join(", ")})`
-        : `- "${p.name}"`
-    ).join("\n");
+    const projectsDataRaw = getActiveProjectsWithAliases();
+    // Phase 2: pre-rank by graph-Jaccard similarity to TODO context
+    const projectsRanked = rankProjectsByGraphSignal(uid, projectsDataRaw);
+    // Take top-K by graph score, but always include alias-matching projects
+    // (handled by LLM since aliases are passed). Top-K cap keeps prompt small.
+    const topK = Math.min(state.settings.graphJaccardTopK, projectsRanked.length);
+    const projectsData = projectsRanked.slice(0, topK);
+    const projectListLines = projectsData.map(p => {
+      const scoreNote = p.graphScore > 0
+        ? ` [graph-similarity: ${p.graphScore.toFixed(2)}]`
+        : "";
+      return p.aliases.length
+        ? `- "${p.name}" (aliases: ${p.aliases.join(", ")})${scoreNote}`
+        : `- "${p.name}"${scoreNote}`;
+    }).join("\n");
+
+    // Phase 2: include recent corrections as few-shot examples
+    const recentCorrections = getRecentCorrections(state.settings.fewShotCorrectionsCount);
+    const correctionsBlock = recentCorrections.length
+      ? `\n\nLEARNED FROM PAST CORRECTIONS (you previously suggested a project, the user manually changed it — learn from these):\n${recentCorrections.join("\n")}\n`
+      : "";
 
     // Entities = pages with Aliases::, EXCLUDING active projects (those are
     // already in the project list above). These are typically people, things,
@@ -548,11 +777,11 @@ Cleaned-text field — simplify the TODO title:
 - Keep the cleaned title >= 12 chars (or null).
 - If unsure whether removing a word loses meaning, set cleaned_text null.
 
-Active projects with aliases (use for "project" field):
+Active projects (pre-ranked by graph-similarity to this TODO's context — projects with graph-similarity > 0 share [[Page]] refs with the TODO and are STRUCTURALLY connected; weight them more strongly):
 ${projectListLines}
 
 Other entities with aliases (use to TAG in notes via [[Canonical Name]] — these are people, places, things, NOT projects):
-${entityListLines}`;
+${entityListLines}${correctionsBlock}`;
 
     try {
       state.callsToday++;
@@ -711,11 +940,23 @@ ${entityListLines}`;
       : "auto-attributed";
     const confSuffix = lowConf ? ` (low conf ${attrs.confidence.toFixed(2)} — verify)` : "";
     blocks.push(`BT_attrNotes:: ${userNotes}${confSuffix}`);
+    // Track block UIDs we create — specifically the BT_attrProject one
+    // gets a correction-learning watcher.
+    const createdUids = [];
     for (let i = 0; i < blocks.length; i++) {
+      const newUid = window.roamAlphaAPI.util.generateUID();
       await window.roamAlphaAPI.data.block.create({
         location: { "parent-uid": parentUid, order: i },
-        block: { string: blocks[i] },
+        block: { uid: newUid, string: blocks[i] },
       });
+      createdUids.push({ uid: newUid, str: blocks[i] });
+    }
+    // Register correction watcher on the BT_attrProject block (if present)
+    if (attrs.project) {
+      const btProjEntry = createdUids.find(c => c.str.startsWith("BT_attrProject::"));
+      if (btProjEntry) {
+        trackAttribution(btProjEntry.uid, parentUid, attrs.project, originalText);
+      }
     }
 
     // Clean the parent TODO text to remove hints now captured in attrs.
@@ -938,6 +1179,26 @@ ${entityListLines}`;
       state.settings.autoCreateProjects = !state.settings.autoCreateProjects;
       log("info", `autoCreateProjects: ${state.settings.autoCreateProjects} ${state.settings.autoCreateProjects ? "(min conf " + state.settings.autoCreateMinConfidence + ", cap " + state.settings.autoCreateDailyCap + "/day)" : ""}`);
     });
+    add("Auto-Attribute: show recent corrections (debug)", () => {
+      const recent = getRecentCorrections(state.settings.fewShotCorrectionsCount);
+      if (!recent.length) {
+        log("info", "no corrections yet — change a BT_attrProject value and the script will learn");
+        return;
+      }
+      log("info", `last ${recent.length} corrections (used as few-shot in LLM prompt):`);
+      for (const c of recent) console.log("  " + c);
+    });
+    add("Auto-Attribute: show graph-similarity for focused TODO (debug)", () => {
+      const f = window.roamAlphaAPI.ui.getFocusedBlock();
+      if (!f) return log("info", "no focused block");
+      const projects = getActiveProjectsWithAliases();
+      const ranked = rankProjectsByGraphSignal(f["block-uid"], projects);
+      console.table(ranked.map(p => ({
+        project: p.name,
+        graph_score: p.graphScore.toFixed(3),
+        aliases: p.aliases.join(", ") || "(none)",
+      })));
+    });
     add("Auto-Attribute: convert existing flat BT_attrProject to dropdown (bulk)", async () => {
       if (!confirm("Convert ALL existing BT_attrProject:: [[X]] blocks to {{or:}} dropdown format?\n\nThis lets you pick from your project history via Universal Selector. Reversible by manual edit. Continue?")) return;
       try {
@@ -1036,6 +1297,8 @@ ${entityListLines}`;
     startScan();
     // Initial hub sync (best-effort, non-blocking)
     syncActiveProjectsHub().catch(e => log("warn", "initial hub sync failed", e));
+    // Phase 2: rehydrate correction watchers from previous sessions
+    rehydrateTracking();
     window[`${NAMESPACE}_state`] = state;
     log("info", `ready. ${state.processedToday.size} already processed today.`);
   }
@@ -1045,6 +1308,12 @@ ${entityListLines}`;
     if (state.pullWatchUnsub) try { state.pullWatchUnsub(); } catch {}
     for (const t of state.pending.values()) clearTimeout(t);
     state.pending.clear();
+    // Unwatch correction watchers
+    for (const [uid, info] of Object.entries(state.trackedAttributions)) {
+      if (info.watcherCb) {
+        try { window.roamAlphaAPI.data.removePullWatch("[:block/string]", [":block/uid", uid], info.watcherCb); } catch {}
+      }
+    }
     log("info", "cleaned up");
   }
   window[`${NAMESPACE}_cleanup`] = cleanup;
