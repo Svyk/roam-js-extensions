@@ -1,4 +1,14 @@
-/* auto-attribute-todo v1.1.1
+/* auto-attribute-todo v1.1.2
+ *
+ * v1.1.2 — clean redundant hints from the TODO title. After BT_attr children
+ * are assigned, if the title contained "tomorrow"/date words, person aliases,
+ * or other hints that got captured into attributes, the AI proposes a
+ * cleaned title and the script updates the parent block. E.g.:
+ *   Before: "{{[[TODO]]}} review plan with sanitation team tomorrow"
+ *   After:  "{{[[TODO]]}} review plan with sanitation team"  (since BT_attrDue
+ *           captured "tomorrow")
+ * Conservative — only cleans when the AI is confident the removed phrase is
+ * captured in attributes. Toggle off via "Auto-Attribute: toggle clean-text".
  *
  * v1.1.1 — people / entity aliasing. Reads Aliases:: from ANY page (not
  * just active projects), so when a TODO mentions "Lori" the AI knows to
@@ -43,7 +53,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.1.1";
+  const VERSION = "1.1.2";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -61,6 +71,7 @@
     contextPathDepth: 5,         // how many ancestors to include in roamContext
     contextChildren: true,       // include block's children (subtasks, notes)
     contextSiblings: true,       // include sibling blocks (other items in same list)
+    cleanTodoText: true,         // rewrite TODO title to remove hints captured in attrs
   };
 
   const state = {
@@ -297,7 +308,7 @@ Context-aware project matching:
 - Always return the CANONICAL project name from the list below, never the alias.
 - If nothing fits, set "project": null.
 
-Notes field — make it useful, not just restating the title:
+Notes field — make it useful, NOT just restating the title:
 - Pull WHO the task is for (named in parent/sibling blocks). When you mention
   a person/entity from the "Other entities" list below, ALWAYS write their name
   as a Roam page link [[Canonical Name]] (NOT the alias). This creates a
@@ -306,7 +317,26 @@ Notes field — make it useful, not just restating the title:
 - Pull the TRIGGER (the meeting / discussion / event the parent references)
 - Pull RELATED PAGE links if siblings reference them
 - Keep it ONE LINE, max ~120 chars
+- DO NOT just paraphrase the title — if there's no genuinely new context
+  beyond what the title says, set notes null. Notes should ADD information.
 - If parent is just a daily-page bullet with no context, set notes null
+
+Cleaned-text field — simplify the TODO title:
+- After you've captured info into BT_attr children, the original title often
+  contains REDUNDANT hints. Remove them so the title stays focused on the action.
+- Date words ("tomorrow", "today", "Friday", "next week", "by EOD"): REMOVE
+  them from cleaned_text IF you set due_offset_days. The date is captured.
+- Urgency words ("urgent", "ASAP", "important", "must"): REMOVE if you set
+  priority High. The priority is captured.
+- "for [Person]" phrases: REMOVE if the person is captured in notes via
+  [[Canonical Name]]. The notes carry the WHO.
+- Project hints: ONLY remove if it's a clear redundant tag (e.g. "EMP" hint
+  + project=EMP). Don't remove if the word is integral to the action (e.g.
+  don't strip "EMP" if action is "build EMP dashboard").
+- Filler words ("need to", "should") can be cleaned if the action verb is clear.
+- ALWAYS preserve {{[[TODO]]}} prefix.
+- Keep the cleaned title >= 12 chars (or null).
+- If unsure whether removing a word loses meaning, set cleaned_text null.
 
 Active projects with aliases (use for "project" field):
 ${projectListLines}
@@ -371,7 +401,7 @@ ${entityListLines}`;
   }
 
   /* ---------- insertion ---------- */
-  async function insertAttrs(parentUid, attrs) {
+  async function insertAttrs(parentUid, attrs, originalText) {
     const blocks = [];
     if (attrs.project) blocks.push(`BT_attrProject:: [[${attrs.project}]]`);
     if (Number.isInteger(attrs.due_offset_days))
@@ -381,7 +411,6 @@ ${entityListLines}`;
     if (attrs.context) blocks.push(`BT_attrContext:: ${attrs.context}`);
     const lowConf = typeof attrs.confidence === "number"
       && attrs.confidence < state.settings.confidenceThreshold;
-    // Use the LLM-generated notes if it gave us something substantive, otherwise default.
     const userNotes = (attrs.notes && typeof attrs.notes === "string" && attrs.notes.trim().length > 5)
       ? attrs.notes.trim()
       : "auto-attributed";
@@ -392,6 +421,34 @@ ${entityListLines}`;
         location: { "parent-uid": parentUid, order: i },
         block: { string: blocks[i] },
       });
+    }
+
+    // OPTIONAL: clean the parent TODO text to remove hints now captured in attrs.
+    // Conservative guards: must start with {{[[TODO]]}}, must be shorter than
+    // original, must be at least minTextLength, and must differ from original.
+    if (
+      state.settings.cleanTodoText &&
+      attrs.cleaned_text &&
+      typeof attrs.cleaned_text === "string"
+    ) {
+      const cleaned = attrs.cleaned_text.trim();
+      const looksValid =
+        cleaned.includes("{{[[TODO]]}}") &&
+        cleaned.length >= state.settings.minTextLength &&
+        cleaned.length < (originalText || "").length &&
+        cleaned !== originalText;
+      if (looksValid) {
+        try {
+          await window.roamAlphaAPI.data.block.update({
+            block: { uid: parentUid, string: cleaned },
+          });
+          log("info", `cleaned title [${parentUid}]: ${(originalText.length - cleaned.length)} chars dropped`);
+        } catch (e) {
+          log("warn", `cleaned-text update failed [${parentUid}]`, e);
+        }
+      } else if (cleaned) {
+        log("debug", `skipped cleaned_text (failed guards)`, { cleaned, originalText });
+      }
     }
   }
 
@@ -459,7 +516,7 @@ ${entityListLines}`;
       return;
     }
     try {
-      await insertAttrs(uid, attrs);
+      await insertAttrs(uid, attrs, text);
       await logToRoam(uid, attrs, null);
     } catch (e) {
       log("error", `insert failed (${uid})`, e);
@@ -552,6 +609,10 @@ ${entityListLines}`;
     add("Auto-Attribute: toggle suggestion-only mode", () => {
       state.settings.requireConfirmation = !state.settings.requireConfirmation;
       log("info", `requireConfirmation: ${state.settings.requireConfirmation}`);
+    });
+    add("Auto-Attribute: toggle clean-text (rewrite TODO title)", () => {
+      state.settings.cleanTodoText = !state.settings.cleanTodoText;
+      log("info", `cleanTodoText: ${state.settings.cleanTodoText}`);
     });
     add("Auto-Attribute: show stats", () => {
       log("info", "stats", {
