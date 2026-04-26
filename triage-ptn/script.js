@@ -1,3 +1,6 @@
+/* triage-ptn v1.0.4 — log entries use plain [uid] text instead of ((uid)) refs
+ * (avoids polluting source-block backlink count). Same change as auto-attribute-todo v1.0.4.
+ */
 /* triage-ptn v1.0.3 — STOP RETRY LOOP (same fix as auto-attribute-todo v1.0.3):
  * mark uid as attempted-today before LLM call, so failures don't retry on the
  * 10-min scan. Reduce scan budget to 10 per cycle. Bump scan interval to 20 min.
@@ -14,7 +17,7 @@
  * Requires: Live AI Assistant with "Enable Public API" toggled ON.
  */
 ;(function () {
-  const VERSION = "1.0.3";
+  const VERSION = "1.0.4";
   const NAMESPACE = "triage-ptn";
   const TAG_PAGE = "ptn";
   const LOG_PAGE = "Triage PTN Log";
@@ -178,9 +181,10 @@ Use [[Time Block Constraints]] and [[Chief of Staff/Memory]] in your context to 
         });
       }
       const ts = new Date().toISOString().slice(11, 19);
+      // Plain [uid] text instead of ((uid)) to avoid backlink pollution.
       const summary = error
-        ? `${ts} FAIL ((${uid})): ${error}`
-        : `${ts} ((${uid})) → ${classification.classification} (conf ${(classification.confidence ?? 0).toFixed(2)})`;
+        ? `${ts} FAIL [${uid}]: ${error}`
+        : `${ts} [${uid}] → ${classification.classification} (conf ${(classification.confidence ?? 0).toFixed(2)})`;
       await window.roamAlphaAPI.data.block.create({
         location: { "parent-uid": pageUid, order: "last" },
         block: { string: `${formatRoamDate(0)} ${summary}` },

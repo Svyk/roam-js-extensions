@@ -1,4 +1,9 @@
-/* auto-attribute-todo v1.0.3
+/* auto-attribute-todo v1.0.4
+ *
+ * v1.0.4 — log entries no longer use ((uid)) Roam block-refs (was polluting
+ * the source TODO's backlink count). Uses plain `[uid]` text instead.
+ *
+ * v1.0.3
  *
  * Watches for new {{[[TODO]]}} blocks and auto-fills BT_attr* children
  * (project, due, priority, energy, context) using window.LiveAI_API.
@@ -20,7 +25,7 @@
  * robust manual parse (strips ```json fences if present).
  */
 ;(function () {
-  const VERSION = "1.0.3";
+  const VERSION = "1.0.4";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -257,9 +262,11 @@ Active projects (case-sensitive): ${JSON.stringify(projects)}`;
         });
       }
       const ts = new Date().toISOString().slice(11, 19);
+      // Plain `[uid]` text — NOT ((uid)) — to avoid polluting the source
+      // TODO's backlink count with log entries.
       const summary = error
-        ? `${ts} FAIL ((${uid})): ${error}`
-        : `${ts} OK ((${uid})) → ${attrs.project || "no-project"} / ${attrs.priority || "?"} / conf ${(attrs.confidence ?? 0).toFixed(2)}`;
+        ? `${ts} FAIL [${uid}]: ${error}`
+        : `${ts} OK [${uid}] → ${attrs.project || "no-project"} / ${attrs.priority || "?"} / conf ${(attrs.confidence ?? 0).toFixed(2)}`;
       await window.roamAlphaAPI.data.block.create({
         location: { "parent-uid": pageUid, order: "last" },
         block: { string: `${formatRoamDate(0)} ${summary}` },
@@ -285,7 +292,7 @@ Active projects (case-sensitive): ${JSON.stringify(projects)}`;
       return;
     }
 
-    log("info", `processing ((${uid})) "${text.slice(0, 60)}"`);
+    log("info", `processing [${uid}] "${text.slice(0, 60)}"`);
     // Mark as attempted-today UP FRONT so any failure path doesn't loop on the
     // 5-min safety scan. User can manually retry via "process focused TODO now"
     // (which removes the uid from processedToday before re-processing).
