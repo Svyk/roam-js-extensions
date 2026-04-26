@@ -1,4 +1,4 @@
-/* auto-attribute-todo v1.0.2
+/* auto-attribute-todo v1.0.3
  *
  * Watches for new {{[[TODO]]}} blocks and auto-fills BT_attr* children
  * (project, due, priority, energy, context) using window.LiveAI_API.
@@ -7,14 +7,20 @@
  * Install: paste inside a `{{[[roam/js]]}}` block, approve when prompted.
  * Commands: open command palette, type "Auto-Attribute" — manage from there.
  *
+ * v1.0.3 — STOP RETRY LOOP. v1.0.2 forgot to add a UID to processedToday
+ * when the LLM call failed, so the 5-min safety scan retried the same broken
+ * call every 5 min forever. Now: any block we ATTEMPT (success or failure)
+ * goes into processedToday so it's skipped on subsequent scans within the
+ * same day. User can manually retry via "process focused TODO now".
+ *   Also: scan-budget reduced from 25 to 10 per cycle. Safety-scan interval
+ *   bumped from 5 min to 15 min.
+ *
  * v1.0.2 — fix LLM result parsing: LiveAI's json_object mode requires a
  * `{"response": ...}` wrapper that we don't ask for. Switch to text mode +
  * robust manual parse (strips ```json fences if present).
- *   Also limit safety scan to TODOs on daily pages within last 14 days +
- *   block UIDs whose ref count == 0 (avoids burning calls on legacy TODOs).
  */
 ;(function () {
-  const VERSION = "1.0.2";
+  const VERSION = "1.0.3";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -24,7 +30,8 @@
     minTextLength: 12,           // skip TODOs shorter than this (probably still being typed)
     confidenceThreshold: 0.6,    // below this → flag for review instead of silent insert
     dailyCallCap: 100,           // hard ceiling on AI calls per day
-    scanIntervalMs: 5 * 60_000,  // safety scan every 5 min for missed blocks
+    scanIntervalMs: 15 * 60_000, // safety scan every 15 min for missed blocks (was 5)
+    scanBudgetPerCycle: 10,      // max blocks to schedule per scan cycle (was 25)
     contextPages: ["Time Block Constraints", "Chief of Staff/Memory"],
     requireConfirmation: false,  // if true, log suggestion only — don't insert
   };
@@ -279,6 +286,12 @@ Active projects (case-sensitive): ${JSON.stringify(projects)}`;
     }
 
     log("info", `processing ((${uid})) "${text.slice(0, 60)}"`);
+    // Mark as attempted-today UP FRONT so any failure path doesn't loop on the
+    // 5-min safety scan. User can manually retry via "process focused TODO now"
+    // (which removes the uid from processedToday before re-processing).
+    state.processedToday.add(uid);
+    persistProcessed();
+
     const attrs = await attribute(uid, text);
     if (!attrs) {
       await logToRoam(uid, null, "no result");
@@ -291,8 +304,6 @@ Active projects (case-sensitive): ${JSON.stringify(projects)}`;
     }
     try {
       await insertAttrs(uid, attrs);
-      state.processedToday.add(uid);
-      persistProcessed();
       await logToRoam(uid, attrs, null);
     } catch (e) {
       log("error", `insert failed (${uid})`, e);
@@ -311,7 +322,10 @@ Active projects (case-sensitive): ${JSON.stringify(projects)}`;
     state.scanTimer = setInterval(() => {
       if (!state.settings.enabled) return;
       const uids = findAllTodos();
+      let queued = 0;
+      const budget = state.settings.scanBudgetPerCycle;
       for (const uid of uids) {
+        if (queued >= budget) break;
         if (state.processedToday.has(uid)) continue;
         if (state.pending.has(uid)) continue;
         const data = getBlock(uid);
@@ -322,7 +336,9 @@ Active projects (case-sensitive): ${JSON.stringify(projects)}`;
         }
         if ((data[":block/string"] || "").length < state.settings.minTextLength) continue;
         schedule(uid);
+        queued++;
       }
+      if (queued > 0) log("info", `scan queued ${queued}/${budget}`);
     }, state.settings.scanIntervalMs);
   }
 
@@ -395,14 +411,26 @@ Active projects (case-sensitive): ${JSON.stringify(projects)}`;
     add("Auto-Attribute: scan now", () => {
       const uids = findAllTodos();
       let queued = 0;
+      const budget = state.settings.scanBudgetPerCycle;
       for (const uid of uids) {
+        if (queued >= budget) break;
         if (state.processedToday.has(uid) || state.pending.has(uid)) continue;
         const data = getBlock(uid);
         if (!data || hasBTProject(data)) continue;
         if ((data[":block/string"] || "").length < state.settings.minTextLength) continue;
         schedule(uid); queued++;
       }
-      log("info", `scan queued ${queued} blocks`);
+      log("info", `manual scan queued ${queued}/${budget} blocks`);
+    });
+    add("Auto-Attribute: emergency stop (cleanup + disable)", () => {
+      state.settings.enabled = false;
+      try { cleanup(); } catch (e) { log("warn", "cleanup err", e); }
+      log("info", "EMERGENCY STOP — disabled, scan + pullwatch killed for this tab. Refresh page to restart.");
+    });
+    add("Auto-Attribute: clear processedToday cache (allow re-process)", () => {
+      state.processedToday = new Set();
+      persistProcessed();
+      log("info", "processedToday cleared — next scan will re-evaluate everything (within budget)");
     });
   }
 

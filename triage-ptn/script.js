@@ -1,4 +1,7 @@
-/* triage-ptn v1.0.2 — same json-mode parse fix as auto-attribute-todo v1.0.2 */
+/* triage-ptn v1.0.3 — STOP RETRY LOOP (same fix as auto-attribute-todo v1.0.3):
+ * mark uid as attempted-today before LLM call, so failures don't retry on the
+ * 10-min scan. Reduce scan budget to 10 per cycle. Bump scan interval to 20 min.
+ */
 /* triage-ptn v1.0.0
  *
  * Watches for blocks tagged with #ptn (process-this-now mobile capture) and
@@ -11,7 +14,7 @@
  * Requires: Live AI Assistant with "Enable Public API" toggled ON.
  */
 ;(function () {
-  const VERSION = "1.0.2";
+  const VERSION = "1.0.3";
   const NAMESPACE = "triage-ptn";
   const TAG_PAGE = "ptn";
   const LOG_PAGE = "Triage PTN Log";
@@ -21,7 +24,8 @@
     debounceMs: 8000,            // mobile capture often comes in bursts; wait
     minTextLength: 8,
     dailyCallCap: 80,
-    scanIntervalMs: 10 * 60_000,
+    scanIntervalMs: 20 * 60_000,  // safety scan every 20 min (was 10)
+    scanBudgetPerCycle: 10,        // max blocks to schedule per scan
     contextPages: ["Time Block Constraints", "Chief of Staff/Memory"],
   };
 
@@ -197,12 +201,14 @@ Use [[Time Block Constraints]] and [[Chief of Staff/Memory]] in your context to 
       return;
     }
     log("info", `triaging ((${uid})) "${text.slice(0, 60)}"`);
+    // Mark as attempted-today UP FRONT so any failure path doesn't loop.
+    state.processedToday.add(uid);
+    persistProcessed();
+
     const c = await classify(uid, text);
     if (!c) { await logToRoam(uid, null, "no result"); return; }
     try {
       await insertSuggestion(uid, c);
-      state.processedToday.add(uid);
-      persistProcessed();
       await logToRoam(uid, c, null);
     } catch (e) {
       log("error", `insert failed`, e);
@@ -219,13 +225,18 @@ Use [[Time Block Constraints]] and [[Chief of Staff/Memory]] in your context to 
     state.scanTimer = setInterval(() => {
       if (!state.settings.enabled) return;
       const uids = findPtnBlocks();
+      let queued = 0;
+      const budget = state.settings.scanBudgetPerCycle;
       for (const uid of uids) {
+        if (queued >= budget) break;
         if (state.processedToday.has(uid) || state.pending.has(uid)) continue;
         const data = getBlock(uid);
         if (!data || hasTriageSuggestion(data)) continue;
         if ((data[":block/string"] || "").length < state.settings.minTextLength) continue;
         schedule(uid);
+        queued++;
       }
+      if (queued > 0) log("info", `scan queued ${queued}/${budget}`);
     }, state.settings.scanIntervalMs);
   }
 
@@ -272,14 +283,26 @@ Use [[Time Block Constraints]] and [[Chief of Staff/Memory]] in your context to 
     add("Triage PTN: scan now", () => {
       const uids = findPtnBlocks();
       let q = 0;
+      const budget = state.settings.scanBudgetPerCycle;
       for (const uid of uids) {
+        if (q >= budget) break;
         if (state.processedToday.has(uid) || state.pending.has(uid)) continue;
         const data = getBlock(uid);
         if (!data || hasTriageSuggestion(data)) continue;
         if ((data[":block/string"] || "").length < state.settings.minTextLength) continue;
         schedule(uid); q++;
       }
-      log("info", `queued ${q}`);
+      log("info", `manual scan queued ${q}/${budget}`);
+    });
+    add("Triage PTN: emergency stop", () => {
+      state.settings.enabled = false;
+      try { cleanup(); } catch (e) { log("warn", "cleanup err", e); }
+      log("info", "EMERGENCY STOP — disabled. Refresh page to restart.");
+    });
+    add("Triage PTN: clear processedToday cache", () => {
+      state.processedToday = new Set();
+      persistProcessed();
+      log("info", "processedToday cleared");
     });
     add("Triage PTN: stats", () => {
       log("info", "stats", {
