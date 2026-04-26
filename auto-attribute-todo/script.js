@@ -1,4 +1,10 @@
-/* auto-attribute-todo v1.5.0
+/* auto-attribute-todo v1.6.0
+ *
+ * v1.6.0 — Project lifecycle commands. Archive a project (sets
+ * Project Status:: Archive, auto-removes from dropdown), unarchive (flip
+ * back to Active), list-by-status. Picker uses prompt() with the active
+ * list shown. The hub auto-syncs after every transition so dropdown
+ * reflects the change immediately.
  *
  * v1.5.0 — Phase 2: smarter project matching + correction learning:
  *   (a) Strip the auto-maintained comment block from [[Active Projects]] hub —
@@ -115,7 +121,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.5.0";
+  const VERSION = "1.6.0";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -479,6 +485,130 @@
     } catch (e) {
       return [];
     }
+  }
+
+  /* ---------- Project lifecycle (archive / unarchive) ----------
+   * Sets Project Status:: <newStatus> on the page. Creates the block if it
+   * doesn't exist; updates if it does. Then re-syncs the hub so the
+   * dropdown reflects the change immediately. */
+  async function setProjectStatus(projectName, newStatus) {
+    const safeName = projectName.replaceAll('"', '\\"');
+    const pageUid = window.roamAlphaAPI.q(
+      `[:find ?u . :where [?p :node/title "${safeName}"] [?p :block/uid ?u]]`
+    );
+    if (!pageUid) {
+      log("error", `page [[${projectName}]] not found`);
+      return false;
+    }
+    try {
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?uid
+         :where
+         [?p :node/title "${safeName}"]
+         [?b :block/page ?p]
+         [?b :block/uid ?uid]
+         [?b :block/string ?s]
+         [(clojure.string/starts-with? ?s "Project Status::")]]
+      `);
+      const newStr = `Project Status:: ${newStatus}`;
+      if (rows.length === 0) {
+        await window.roamAlphaAPI.data.block.create({
+          location: { "parent-uid": pageUid, order: 0 },
+          block: { string: newStr },
+        });
+      } else {
+        // Update the first match (assume only one Project Status:: per page)
+        await window.roamAlphaAPI.data.block.update({
+          block: { uid: rows[0][0], string: newStr },
+        });
+        // Delete any extra Project Status blocks (legacy mistakes)
+        for (let i = 1; i < rows.length; i++) {
+          try { await window.roamAlphaAPI.data.block.delete({ block: { uid: rows[i][0] } }); } catch {}
+        }
+      }
+      await syncActiveProjectsHub();
+      const emoji = newStatus === "Archive" ? "📦" : (newStatus === "Active" ? "✅" : "🔄");
+      log("info", `${emoji} project [[${projectName}]] → ${newStatus}`);
+      return true;
+    } catch (e) {
+      log("error", `setProjectStatus failed for [[${projectName}]]`, e);
+      return false;
+    }
+  }
+
+  function getProjectsByStatus(status) {
+    try {
+      const prefix = `Project Status:: ${status}`;
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?title
+         :where
+         [?p :node/title ?title]
+         [?b :block/page ?p]
+         [?b :block/string ?s]
+         [(clojure.string/starts-with? ?s "${prefix}")]]
+      `);
+      return [...new Set(rows.flat())]
+        .filter(t => !isDailyPageTitle(t))
+        .filter(t => !isSystemPageTitle(t))
+        .sort();
+    } catch (e) {
+      log("warn", `getProjectsByStatus(${status}) failed`, e);
+      return [];
+    }
+  }
+
+  function getCurrentPageTitle() {
+    try {
+      const uid = window.roamAlphaAPI.ui.mainWindow.getOpenPageOrBlockUid();
+      if (!uid) return null;
+      const data = window.roamAlphaAPI.data.pull("[:node/title]", [":block/uid", uid]);
+      return data?.[":node/title"] || null;
+    } catch { return null; }
+  }
+
+  async function archiveProjectFlow() {
+    const currentTitle = getCurrentPageTitle();
+    const activeProjects = getActiveProjectsWithAliases().map(p => p.name);
+    let name = null;
+    if (currentTitle && activeProjects.includes(currentTitle)) {
+      // User is viewing an active project page — offer to archive it
+      if (confirm(`Archive [[${currentTitle}]]? It will move to Project Status:: Archive and disappear from the dropdown.`)) {
+        name = currentTitle;
+      } else {
+        return;
+      }
+    } else {
+      const list = activeProjects.join("\n  - ");
+      name = window.prompt(
+        `Enter project name to archive.\n\nActive projects:\n  - ${list}\n\nProject name:`
+      );
+      if (!name) return;
+      name = name.trim();
+      if (!activeProjects.includes(name)) {
+        if (!confirm(`[[${name}]] isn't in the active list. Archive anyway?`)) return;
+      }
+    }
+    const ok = await setProjectStatus(name, "Archive");
+    if (ok) alert(`Archived [[${name}]] — removed from dropdown.`);
+  }
+
+  async function unarchiveProjectFlow() {
+    const archived = getProjectsByStatus("Archive");
+    if (archived.length === 0) {
+      alert("No archived projects found.");
+      return;
+    }
+    const list = archived.join("\n  - ");
+    const name = window.prompt(
+      `Enter project name to UNARCHIVE (back to Active).\n\nArchived projects:\n  - ${list}\n\nProject name:`
+    );
+    if (!name) return;
+    const trimmed = name.trim();
+    if (!archived.includes(trimmed)) {
+      if (!confirm(`[[${trimmed}]] isn't in the archive list. Unarchive anyway?`)) return;
+    }
+    const ok = await setProjectStatus(trimmed, "Active");
+    if (ok) alert(`Unarchived [[${trimmed}]] — back in the dropdown.`);
   }
 
   /* ---------- Active Projects hub page sync ----------
@@ -1187,6 +1317,20 @@ ${entityListLines}${correctionsBlock}`;
       }
       log("info", `last ${recent.length} corrections (used as few-shot in LLM prompt):`);
       for (const c of recent) console.log("  " + c);
+    });
+    add("Auto-Attribute: archive a project (move to Archive status)", archiveProjectFlow);
+    add("Auto-Attribute: unarchive a project (back to Active)", unarchiveProjectFlow);
+    add("Auto-Attribute: list projects by status (debug)", () => {
+      const statuses = ["Active", "Ongoing", "On Hold", "Paused", "Archive", "Done", "Completed"];
+      const out = {};
+      for (const s of statuses) out[s] = getProjectsByStatus(s);
+      console.log("[auto-attr-todo] projects by status:");
+      for (const [s, list] of Object.entries(out)) {
+        if (list.length > 0) {
+          console.log(`  ${s} (${list.length}):`);
+          list.forEach(p => console.log(`    - ${p}`));
+        }
+      }
     });
     add("Auto-Attribute: show graph-similarity for focused TODO (debug)", () => {
       const f = window.roamAlphaAPI.ui.getFocusedBlock();
