@@ -1,4 +1,18 @@
-/* auto-attribute-todo v1.3.0
+/* auto-attribute-todo v1.4.0
+ *
+ * v1.4.0 — FIVE refinements based on real-world usage:
+ *   (a) Active Projects hub query was too loose — matched ANY block containing
+ *       "Project Status:: Active" (e.g. comments referencing the convention).
+ *       Now uses strict `starts-with "Project Status:: Active"` AND filters
+ *       out daily pages + roam/* system pages + the hub itself.
+ *   (b) Recognize "Active" AND "Ongoing" both as valid project states. Other
+ *       statuses (Done, Archive, etc.) excluded from the dropdown pool.
+ *   (c) Auto-create projects ON BY DEFAULT (was opt-in). Toggle off via
+ *       "Auto-Attribute: toggle auto-create projects".
+ *   (d) Debounce default 30s → 5s — user types thoughts first, then converts
+ *       to TODO, so the long delay was wasted patience.
+ *   (e) Sync hub immediately after auto-create (new project appears in
+ *       dropdowns instantly, not on next 15-min scan).
  *
  * v1.3.0 — TWO new features:
  *   (a) Auto-maintained [[Active Projects]] hub page that mirrors current
@@ -83,13 +97,13 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.3.0";
+  const VERSION = "1.4.0";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
   const DEFAULTS = {
     enabled: true,
-    debounceMs: 30000,           // 30 sec — give user time to think before AI fires
+    debounceMs: 5000,            // 5 sec — user types thoughts then converts to TODO
     minTextLength: 12,
     confidenceThreshold: 0.6,
     dailyCallCap: 100,
@@ -97,17 +111,18 @@
     scanBudgetPerCycle: 10,
     contextPages: ["Time Block Constraints", "Chief of Staff/Memory"],
     requireConfirmation: false,
-    aliasKeyword: "Aliases",     // configurable per dive2Pro/roam-aliases convention
-    contextPathDepth: 5,         // how many ancestors to include in roamContext
-    contextChildren: true,       // include block's children (subtasks, notes)
-    contextSiblings: true,       // include sibling blocks (other items in same list)
-    cleanTodoText: true,         // rewrite TODO title to remove hints captured in attrs
-    useDropdown: true,           // emit BT_attrProject as {{or:}} dropdown of top-3 candidates
-    activeProjectsHub: "Active Projects",  // page that mirrors all Project Status:: Active pages
-    syncHubOnScan: true,         // re-sync hub page on each safety scan
-    autoCreateProjects: false,   // create new project pages when AI suggests one (opt-in)
-    autoCreateMinConfidence: 0.7, // AI must be at least this confident to auto-create
-    autoCreateDailyCap: 5,       // max new project pages per day
+    aliasKeyword: "Aliases",
+    contextPathDepth: 5,
+    contextChildren: true,
+    contextSiblings: true,
+    cleanTodoText: true,
+    useDropdown: true,
+    activeProjectsHub: "Active Projects",
+    syncHubOnScan: true,
+    autoCreateProjects: true,    // ON by default — toggle off via cmd palette
+    autoCreateMinConfidence: 0.7,
+    autoCreateDailyCap: 5,
+    activeProjectStatuses: ["Active", "Ongoing"],  // statuses that qualify for dropdown
   };
 
   const state = {
@@ -180,20 +195,40 @@
     return ch.some((c) => (c[":block/string"] || "").startsWith("BT_attrProject::"));
   }
 
+  // Filters for project page candidates
+  function isDailyPageTitle(t) {
+    return /^(January|February|March|April|May|June|July|August|September|October|November|December) \d{1,2}(st|nd|rd|th), \d{4}$/.test(t);
+  }
+  function isSystemPageTitle(t) {
+    if (t.startsWith("roam/")) return true;
+    if (t === state.settings.activeProjectsHub) return true;
+    if (t.startsWith("Chief of Staff/")) return true;
+    return false;
+  }
+
   function getActiveProjectsWithAliases() {
-    // Returns [{name, aliases: []}, ...] for each page tagged Project Status:: Active.
-    // Aliases are read from blocks starting with "Aliases::" on each project page
-    // (dive2Pro/roam-aliases convention — first-level block of a page).
+    // Returns [{name, aliases: []}, ...] for each page tagged with one of
+    // settings.activeProjectStatuses (default: Active, Ongoing).
+    // Strict match: block must START with "Project Status:: <status>" (not just
+    // contain — that would match comments). Filters daily + system pages.
     try {
-      const projectRows = window.roamAlphaAPI.data.q(`
-        [:find ?title
-         :where
-         [?p :node/title ?title]
-         [?b :block/page ?p]
-         [?b :block/string ?s]
-         [(clojure.string/includes? ?s "Project Status:: Active")]]
-      `);
-      const projects = [...new Set(projectRows.flat())].slice(0, 60);
+      const allRows = [];
+      for (const status of state.settings.activeProjectStatuses) {
+        const prefix = `Project Status:: ${status}`;
+        const rows = window.roamAlphaAPI.data.q(`
+          [:find ?title
+           :where
+           [?p :node/title ?title]
+           [?b :block/page ?p]
+           [?b :block/string ?s]
+           [(clojure.string/starts-with? ?s "${prefix}")]]
+        `);
+        allRows.push(...rows.flat());
+      }
+      const projects = [...new Set(allRows)]
+        .filter(t => !isDailyPageTitle(t))
+        .filter(t => !isSystemPageTitle(t))
+        .slice(0, 60);
       const aliasPrefix = state.settings.aliasKeyword + "::";
 
       return projects.map((title) => {
@@ -347,6 +382,8 @@
       }
       state.projectsCreatedToday++;
       log("warn", `🆕 auto-created project [[${safeName}]] (${state.projectsCreatedToday}/${state.settings.autoCreateDailyCap} today). Verify the page is correct.`);
+      // Re-sync hub so the new project appears in dropdowns immediately
+      try { await syncActiveProjectsHub(); } catch {}
       return safeName;
     } catch (e) {
       log("error", `auto-create failed for [[${safeName}]]`, e);
