@@ -1,4 +1,10 @@
-/* auto-attribute-todo v1.1.0
+/* auto-attribute-todo v1.1.1
+ *
+ * v1.1.1 — people / entity aliasing. Reads Aliases:: from ANY page (not
+ * just active projects), so when a TODO mentions "Lori" the AI knows to
+ * tag [[Lori Boyd]] in the notes for backlink discovery. Log entries also
+ * switched back to ((uid)) clickable block-refs (one backlink per TODO per
+ * day is bounded since v1.0.3 caps retries).
  *
  * v1.1.0 — context-aware classification. Reads Aliases:: blocks from each
  * active project page (via dive2Pro/roam-aliases convention) so e.g. "Lori"
@@ -37,7 +43,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.1.0";
+  const VERSION = "1.1.1";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -174,6 +180,41 @@
     return getActiveProjectsWithAliases().map(p => p.name);
   }
 
+  // Returns ALL pages with an Aliases:: block, regardless of project status.
+  // Used to identify people / entities mentioned in TODO text so the AI can
+  // tag them via [[Canonical Name]] page links in BT_attrNotes (creating
+  // useful backlinks on the entity's page).
+  function getAllEntitiesWithAliases() {
+    try {
+      const aliasPrefix = state.settings.aliasKeyword + "::";
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?title ?s
+         :where
+         [?p :node/title ?title]
+         [?b :block/page ?p]
+         [?b :block/string ?s]
+         [(clojure.string/starts-with? ?s "${aliasPrefix}")]]
+      `);
+      const byPage = {};
+      for (const row of rows) {
+        const title = row[0];
+        const str = (row[1] || "").trim();
+        const aliasStr = str.substring(aliasPrefix.length).trim();
+        if (!aliasStr) continue;
+        const aliases = aliasStr.split(",").map(a => a.trim()).filter(Boolean);
+        if (!byPage[title]) byPage[title] = new Set();
+        for (const a of aliases) byPage[title].add(a);
+      }
+      return Object.entries(byPage).map(([name, set]) => ({
+        name,
+        aliases: [...set],
+      }));
+    } catch (e) {
+      log("warn", "entity alias query failed", e);
+      return [];
+    }
+  }
+
   function findAllTodos() {
     // Returns recent TODOs first by block edit time. Scan-budget capped at 25.
     try {
@@ -213,6 +254,18 @@
         : `- "${p.name}"`
     ).join("\n");
 
+    // Entities = pages with Aliases::, EXCLUDING active projects (those are
+    // already in the project list above). These are typically people, things,
+    // or concepts. The LLM should tag them as [[Canonical Name]] in notes.
+    const projectNameSet = new Set(projectsData.map(p => p.name));
+    const entitiesData = getAllEntitiesWithAliases()
+      .filter(e => !projectNameSet.has(e.name));
+    const entityListLines = entitiesData.length
+      ? entitiesData.map(e =>
+          `- [[${e.name}]] (aliases: ${e.aliases.join(", ")})`
+        ).join("\n")
+      : "(none)";
+
     const systemPrompt = `Classify a TODO into Better Tasks attributes. Output ONLY JSON.
 
 You receive the TODO block plus its FULL Roam context: breadcrumb path (parents up to 5 levels deep), sibling blocks in the same list, child blocks (subtasks/notes the user already wrote), and linked pages. Use ALL of this context — not just the TODO text — to classify accurately.
@@ -245,14 +298,21 @@ Context-aware project matching:
 - If nothing fits, set "project": null.
 
 Notes field — make it useful, not just restating the title:
-- Pull WHO the task is for (named in parent/sibling blocks)
+- Pull WHO the task is for (named in parent/sibling blocks). When you mention
+  a person/entity from the "Other entities" list below, ALWAYS write their name
+  as a Roam page link [[Canonical Name]] (NOT the alias). This creates a
+  backlink on their page — extremely useful. E.g. if TODO mentions "Lori",
+  write "[[Lori Boyd]]" in the notes (assuming Lori is an alias for Lori Boyd).
 - Pull the TRIGGER (the meeting / discussion / event the parent references)
-- Pull the RELATED PAGE links if siblings reference [[Page]]s
+- Pull RELATED PAGE links if siblings reference them
 - Keep it ONE LINE, max ~120 chars
-- If the parent is just a daily page bullet with no context, leave notes null
+- If parent is just a daily-page bullet with no context, set notes null
 
-Active projects with aliases:
-${projectListLines}`;
+Active projects with aliases (use for "project" field):
+${projectListLines}
+
+Other entities with aliases (use to TAG in notes via [[Canonical Name]] — these are people, places, things, NOT projects):
+${entityListLines}`;
 
     try {
       state.callsToday++;
@@ -348,11 +408,14 @@ ${projectListLines}`;
         });
       }
       const ts = new Date().toISOString().slice(11, 19);
-      // Plain `[uid]` text — NOT ((uid)) — to avoid polluting the source
-      // TODO's backlink count with log entries.
+      // ((uid)) block-ref so log entries are CLICKABLE — jump back to the
+      // source TODO with one click. Each TODO accrues one backlink per day
+      // (bounded by processedToday cache + once-per-day attempt). Project
+      // name as [[link]] so the log shows up on the project page too.
+      const projectStr = attrs?.project ? `[[${attrs.project}]]` : "no-project";
       const summary = error
-        ? `${ts} FAIL [${uid}]: ${error}`
-        : `${ts} OK [${uid}] → ${attrs.project || "no-project"} / ${attrs.priority || "?"} / conf ${(attrs.confidence ?? 0).toFixed(2)}`;
+        ? `${ts} FAIL ((${uid})): ${error}`
+        : `${ts} OK ((${uid})) → ${projectStr} / ${attrs.priority || "?"} / conf ${(attrs.confidence ?? 0).toFixed(2)}`;
       await window.roamAlphaAPI.data.block.create({
         location: { "parent-uid": pageUid, order: "last" },
         block: { string: `${formatRoamDate(0)} ${summary}` },
