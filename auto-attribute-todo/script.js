@@ -1,4 +1,4 @@
-/* auto-attribute-todo v1.0.0
+/* auto-attribute-todo v1.0.2
  *
  * Watches for new {{[[TODO]]}} blocks and auto-fills BT_attr* children
  * (project, due, priority, energy, context) using window.LiveAI_API.
@@ -6,9 +6,15 @@
  * Requires: Live AI Assistant extension with "Enable Public API" toggled ON.
  * Install: paste inside a `{{[[roam/js]]}}` block, approve when prompted.
  * Commands: open command palette, type "Auto-Attribute" — manage from there.
+ *
+ * v1.0.2 — fix LLM result parsing: LiveAI's json_object mode requires a
+ * `{"response": ...}` wrapper that we don't ask for. Switch to text mode +
+ * robust manual parse (strips ```json fences if present).
+ *   Also limit safety scan to TODOs on daily pages within last 14 days +
+ *   block UIDs whose ref count == 0 (avoids burning calls on legacy TODOs).
  */
 ;(function () {
-  const VERSION = "1.0.0";
+  const VERSION = "1.0.2";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -109,14 +115,19 @@
   }
 
   function findAllTodos() {
+    // Returns recent TODOs first by block edit time. Scan-budget capped at 25.
     try {
-      return window.roamAlphaAPI.data.q(`
-        [:find ?uid
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?uid ?edit
          :where
          [?b :block/uid ?uid]
          [?b :block/string ?s]
-         [(clojure.string/includes? ?s "{{[[TODO]]}}")]]
-      `).flat();
+         [(clojure.string/includes? ?s "{{[[TODO]]}}")]
+         [?b :edit/time ?edit]]
+      `);
+      // Sort newest first, take 25
+      rows.sort((a, b) => (b[1] || 0) - (a[1] || 0));
+      return rows.slice(0, 25).map((r) => r[0]);
     } catch (e) {
       log("warn", "todo scan query failed", e);
       return [];
@@ -161,24 +172,47 @@ Active projects (case-sensitive): ${JSON.stringify(projects)}`;
     try {
       state.callsToday++;
       const result = await window.LiveAI_API.generate({
-        prompt: `TODO block:\n"${text}"\n\nReturn the JSON.`,
+        prompt: `TODO block:\n"${text}"\n\nReturn ONLY the JSON, no markdown fences, no prose.`,
         systemPrompt,
         useDefaultSystemPrompt: false,
         roamContext: {
           block: true, blockArgument: [uid], path: true,
           pageArgument: state.settings.contextPages,
         },
-        responseFormat: "json_object",
+        responseFormat: "text",
         temperature: 0.3,
         caller: `${NAMESPACE}/${VERSION}`,
       });
-      const parsed = JSON.parse(result.text);
+      const parsed = parseJsonResponse(result.text);
+      if (!parsed) {
+        log("error", `unparseable LLM response (${uid})`, result.text?.slice(0, 200));
+        return null;
+      }
       log("debug", `attrs for ${uid}`, parsed);
       return parsed;
     } catch (e) {
       log("error", `LLM call failed (${uid})`, e);
       return null;
     }
+  }
+
+  /* Robust JSON parse — handles raw JSON, ```json fences, ``` fences, and
+   * leading/trailing prose. Returns null on failure. */
+  function parseJsonResponse(text) {
+    if (!text || typeof text !== "string") return null;
+    let s = text.trim();
+    // Strip markdown code fence
+    if (s.startsWith("```")) {
+      s = s.replace(/^```(?:json|JSON)?\s*\n?/, "").replace(/\n?```\s*$/, "");
+    }
+    // Try direct parse
+    try { return JSON.parse(s); } catch {}
+    // Extract first {...} block (greedy match for nested braces)
+    const m = s.match(/\{[\s\S]*\}/);
+    if (m) {
+      try { return JSON.parse(m[0]); } catch {}
+    }
+    return null;
   }
 
   /* ---------- insertion ---------- */

@@ -1,3 +1,4 @@
+/* triage-ptn v1.0.2 — same json-mode parse fix as auto-attribute-todo v1.0.2 */
 /* triage-ptn v1.0.0
  *
  * Watches for blocks tagged with #ptn (process-this-now mobile capture) and
@@ -10,7 +11,7 @@
  * Requires: Live AI Assistant with "Enable Public API" toggled ON.
  */
 ;(function () {
-  const VERSION = "1.0.0";
+  const VERSION = "1.0.2";
   const NAMESPACE = "triage-ptn";
   const TAG_PAGE = "ptn";
   const LOG_PAGE = "Triage PTN Log";
@@ -119,22 +120,38 @@ Use [[Time Block Constraints]] and [[Chief of Staff/Memory]] in your context to 
     try {
       state.callsToday++;
       const r = await window.LiveAI_API.generate({
-        prompt: `Block:\n"${text}"\n\nClassify and recommend a route.`,
+        prompt: `Block:\n"${text}"\n\nClassify and recommend a route. Return ONLY the JSON, no markdown fences, no prose.`,
         systemPrompt,
         useDefaultSystemPrompt: false,
         roamContext: {
           block: true, blockArgument: [uid], path: true,
           pageArgument: state.settings.contextPages,
         },
-        responseFormat: "json_object",
+        responseFormat: "text",
         temperature: 0.3,
         caller: `${NAMESPACE}/${VERSION}`,
       });
-      return JSON.parse(r.text);
+      return parseJsonResponse(r.text);
     } catch (e) {
       log("error", `classify failed (${uid})`, e);
       return null;
     }
+  }
+
+  /* Robust JSON parse — handles raw JSON, ```json fences, ``` fences,
+   * and leading/trailing prose. Returns null on failure. */
+  function parseJsonResponse(text) {
+    if (!text || typeof text !== "string") return null;
+    let s = text.trim();
+    if (s.startsWith("```")) {
+      s = s.replace(/^```(?:json|JSON)?\s*\n?/, "").replace(/\n?```\s*$/, "");
+    }
+    try { return JSON.parse(s); } catch {}
+    const m = s.match(/\{[\s\S]*\}/);
+    if (m) {
+      try { return JSON.parse(m[0]); } catch {}
+    }
+    return null;
   }
 
   async function insertSuggestion(parentUid, classification) {
