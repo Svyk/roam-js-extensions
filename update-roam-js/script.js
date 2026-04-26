@@ -20,7 +20,7 @@
  * Source: github.com/Svyk/roam-js-extensions
  */
 ;(function () {
-  const VERSION = "1.0.0";
+  const VERSION = "1.0.1";
   const NAMESPACE = "update-roam-js";
   const MANIFEST_URL = "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/manifest.json";
   const CACHE_HOURS = 24;
@@ -70,8 +70,9 @@
     const ch = data?.[":block/children"] || [];
     const roamJs = ch.find((c) => (c[":block/string"] || "").includes("{{[[roam/js]]}}"));
     if (!roamJs) return null;
+    const FENCE_START = "`".repeat(3);
     const code = (roamJs[":block/children"] || [])
-      .find((c) => (c[":block/string"] || "").startsWith("```"));
+      .find((c) => (c[":block/string"] || "").startsWith(FENCE_START));
     return {
       pageUid: ru,
       roamJsUid: roamJs[":block/uid"],
@@ -88,7 +89,11 @@
   async function installScript({ name, url }) {
     const pageTitle = `${PAGE_PREFIX}${name}`;
     const code = await fetchScript(url);
-    const wrapped = "```javascript\n" + code + "\n```";
+    // Build fence at runtime so this script's source has no literal triple-backticks
+    // (those would collide with the outer Roam fence if the FULL update-roam-js were
+    // ever installed directly into a roam/js page instead of via the shim).
+    const FENCE = "`".repeat(3);
+    const wrapped = FENCE + "javascript\n" + code + "\n" + FENCE;
 
     // Ensure page exists
     let ru = pageUid(pageTitle);

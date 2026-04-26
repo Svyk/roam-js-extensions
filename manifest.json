@@ -6,7 +6,7 @@
   "scripts": [
     {
       "name": "auto-attribute-todo",
-      "version": "1.0.5",
+      "version": "1.1.0",
       "namespace": "auto-attr-todo",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/auto-attribute-todo/script.js",
       "description": "Auto-fills BT_attr* on new {{[[TODO]]}} blocks via LiveAI_API.",
@@ -48,7 +48,7 @@
     },
     {
       "name": "update-roam-js",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "namespace": "update-roam-js",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/update-roam-js/script.js",
       "description": "Self-bootstrapper + auto-updater for the suite. Install this one first.",

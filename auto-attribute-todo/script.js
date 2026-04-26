@@ -1,9 +1,16 @@
-/* auto-attribute-todo v1.0.5
+/* auto-attribute-todo v1.1.0
+ *
+ * v1.1.0 — context-aware classification. Reads Aliases:: blocks from each
+ * active project page (via dive2Pro/roam-aliases convention) so e.g. "Lori"
+ * in a TODO maps to project "EMP Risk Matrix" if that project has
+ * Aliases:: Lori, Lori Boyd. Also widens roamContext to include the TODO
+ * block's children + siblings + 5-level path (was just block + path).
+ * Debounce default bumped from 3 sec to 30 sec so you have time to think
+ * about a TODO before the AI fires.
  *
  * v1.0.5 — fix script source containing literal triple-backticks in regex
- * patterns (those collide with the OUTER markdown fence when the script is
- * stored in a Roam code block, breaking script execution mid-file). All
- * triple-backticks in source replaced with Unicode-escaped equivalents.
+ * patterns (collided with the OUTER markdown fence). All triple-backticks
+ * in source replaced with Unicode-escaped equivalents.
  *
  * v1.0.4 — log entries no longer use ((uid)) Roam block-refs (was polluting
  * the source TODO's backlink count). Uses plain `[uid]` text instead.
@@ -30,20 +37,24 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.0.5";
+  const VERSION = "1.1.0";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
   const DEFAULTS = {
     enabled: true,
-    debounceMs: 3000,            // wait this long after last edit before processing
-    minTextLength: 12,           // skip TODOs shorter than this (probably still being typed)
-    confidenceThreshold: 0.6,    // below this → flag for review instead of silent insert
-    dailyCallCap: 100,           // hard ceiling on AI calls per day
-    scanIntervalMs: 15 * 60_000, // safety scan every 15 min for missed blocks (was 5)
-    scanBudgetPerCycle: 10,      // max blocks to schedule per scan cycle (was 25)
+    debounceMs: 30000,           // 30 sec — give user time to think before AI fires
+    minTextLength: 12,
+    confidenceThreshold: 0.6,
+    dailyCallCap: 100,
+    scanIntervalMs: 15 * 60_000,
+    scanBudgetPerCycle: 10,
     contextPages: ["Time Block Constraints", "Chief of Staff/Memory"],
-    requireConfirmation: false,  // if true, log suggestion only — don't insert
+    requireConfirmation: false,
+    aliasKeyword: "Aliases",     // configurable per dive2Pro/roam-aliases convention
+    contextPathDepth: 5,         // how many ancestors to include in roamContext
+    contextChildren: true,       // include block's children (subtasks, notes)
+    contextSiblings: true,       // include sibling blocks (other items in same list)
   };
 
   const state = {
@@ -114,9 +125,12 @@
     return ch.some((c) => (c[":block/string"] || "").startsWith("BT_attrProject::"));
   }
 
-  function getActiveProjects() {
+  function getActiveProjectsWithAliases() {
+    // Returns [{name, aliases: []}, ...] for each page tagged Project Status:: Active.
+    // Aliases are read from blocks starting with "Aliases::" on each project page
+    // (dive2Pro/roam-aliases convention — first-level block of a page).
     try {
-      const rows = window.roamAlphaAPI.data.q(`
+      const projectRows = window.roamAlphaAPI.data.q(`
         [:find ?title
          :where
          [?p :node/title ?title]
@@ -124,11 +138,40 @@
          [?b :block/string ?s]
          [(clojure.string/includes? ?s "Project Status:: Active")]]
       `);
-      return [...new Set(rows.flat())].slice(0, 60);  // cap at 60
+      const projects = [...new Set(projectRows.flat())].slice(0, 60);
+      const aliasPrefix = state.settings.aliasKeyword + "::";
+
+      return projects.map((title) => {
+        let aliases = [];
+        try {
+          const aliasRows = window.roamAlphaAPI.data.q(`
+            [:find ?s
+             :where
+             [?p :node/title "${title.replaceAll('"', '\\"')}"]
+             [?b :block/page ?p]
+             [?b :block/string ?s]
+             [(clojure.string/starts-with? ?s "${aliasPrefix}")]]
+          `);
+          const aliasStr = (aliasRows.flat()[0] || "").trim();
+          if (aliasStr) {
+            aliases = aliasStr
+              .substring(aliasPrefix.length)
+              .split(",")
+              .map(a => a.trim())
+              .filter(Boolean);
+          }
+        } catch {}
+        return { name: title, aliases };
+      });
     } catch (e) {
       log("warn", "active projects query failed", e);
       return [];
     }
+  }
+
+  // Backward-compat shim — some other code might still call getActiveProjects()
+  function getActiveProjects() {
+    return getActiveProjectsWithAliases().map(p => p.name);
   }
 
   function findAllTodos() {
@@ -163,28 +206,53 @@
       return null;
     }
 
-    const projects = getActiveProjects();
+    const projectsData = getActiveProjectsWithAliases();
+    const projectListLines = projectsData.map(p =>
+      p.aliases.length
+        ? `- "${p.name}" (aliases: ${p.aliases.join(", ")})`
+        : `- "${p.name}"`
+    ).join("\n");
+
     const systemPrompt = `Classify a TODO into Better Tasks attributes. Output ONLY JSON.
 
+You receive the TODO block plus its FULL Roam context: breadcrumb path (parents up to 5 levels deep), sibling blocks in the same list, child blocks (subtasks/notes the user already wrote), and linked pages. Use ALL of this context — not just the TODO text — to classify accurately.
+
 Schema:
-{"project": <one exact name from active list, or null>,
+{"project": <one exact CANONICAL project name from active list, or null>,
  "priority": "Low"|"Medium"|"High",
  "energy": "Low"|"Medium"|"High",
  "context": "@work"|"@home"|"@computer"|"@errands"|null,
  "due_offset_days": <int 0-30; 0=today, 1=tomorrow>,
+ "notes": "<ONE LINE summary of what this task is for, WHO it's for if mentioned in parent context, and WHY it exists. Pull names of people, meetings, projects from the breadcrumb path or siblings. E.g. 'For Lori per 1:1 meeting on EMP swab review' or 'Follow-up from Mon meeting with Tracy on QC trends'. If no rich context, leave as null and the script will use a default.>",
  "confidence": <0-1>,
- "reasoning": "<one sentence>"}
+ "reasoning": "<one sentence — mention which alias matched, what context informed the project, etc.>"}
 
-Rules from [[Time Block Constraints]] and [[Chief of Staff/Memory]] (in your context):
+Rules from [[Time Block Constraints]] and [[Chief of Staff/Memory]] (already in your context):
 - Working hours 08:00-17:00 = ByHeart QA work only (food safety, R, regulatory) → context @work
 - Personal/Claude/coding = evenings → context @computer
 - Energy High = deep work / writing / debugging
 - Energy Low = admin / email / quick task
 - Priority High requires explicit urgency markers OR critical-path of an active project
 - due_offset_days: 0 if "today/asap/urgent"; 1 default; specific weekday → compute offset; "next week" → 7
-- "project": case-sensitive match against this active list. If nothing fits, null.
 
-Active projects (case-sensitive): ${JSON.stringify(projects)}`;
+Context-aware project matching:
+- Match against project names AND their aliases (case-INSENSITIVE).
+- Use the breadcrumb path: a TODO nested under "Meeting with Lori" inherits Lori-related project context.
+- Use sibling blocks: if siblings reference [[EMP Risk Matrix]] or other project pages, weight those.
+- Use child blocks: if user already wrote a sub-note saying "for Lori", pick the Lori-aliased project.
+- A person's name matching a project's alias (e.g. "Lori" → "EMP Risk Matrix") is a strong signal.
+- Always return the CANONICAL project name from the list below, never the alias.
+- If nothing fits, set "project": null.
+
+Notes field — make it useful, not just restating the title:
+- Pull WHO the task is for (named in parent/sibling blocks)
+- Pull the TRIGGER (the meeting / discussion / event the parent references)
+- Pull the RELATED PAGE links if siblings reference [[Page]]s
+- Keep it ONE LINE, max ~120 chars
+- If the parent is just a daily page bullet with no context, leave notes null
+
+Active projects with aliases:
+${projectListLines}`;
 
     try {
       state.callsToday++;
@@ -193,7 +261,12 @@ Active projects (case-sensitive): ${JSON.stringify(projects)}`;
         systemPrompt,
         useDefaultSystemPrompt: false,
         roamContext: {
-          block: true, blockArgument: [uid], path: true,
+          block: true,
+          blockArgument: [uid],
+          path: true,
+          pathDepth: state.settings.contextPathDepth,
+          children: state.settings.contextChildren,
+          siblings: state.settings.contextSiblings,
           pageArgument: state.settings.contextPages,
         },
         responseFormat: "text",
@@ -248,9 +321,12 @@ Active projects (case-sensitive): ${JSON.stringify(projects)}`;
     if (attrs.context) blocks.push(`BT_attrContext:: ${attrs.context}`);
     const lowConf = typeof attrs.confidence === "number"
       && attrs.confidence < state.settings.confidenceThreshold;
-    blocks.push(`BT_attrNotes:: auto-attributed${
-      lowConf ? ` (low conf ${attrs.confidence.toFixed(2)} — verify)` : ""
-    }`);
+    // Use the LLM-generated notes if it gave us something substantive, otherwise default.
+    const userNotes = (attrs.notes && typeof attrs.notes === "string" && attrs.notes.trim().length > 5)
+      ? attrs.notes.trim()
+      : "auto-attributed";
+    const confSuffix = lowConf ? ` (low conf ${attrs.confidence.toFixed(2)} — verify)` : "";
+    blocks.push(`BT_attrNotes:: ${userNotes}${confSuffix}`);
     for (let i = 0; i < blocks.length; i++) {
       await window.roamAlphaAPI.data.block.create({
         location: { "parent-uid": parentUid, order: i },
