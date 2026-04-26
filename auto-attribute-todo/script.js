@@ -588,6 +588,20 @@ ${entityListLines}`;
       persistProcessed();
       log("info", "processedToday cleared — next scan will re-evaluate everything (within budget)");
     });
+    add("Auto-Attribute: show active projects + aliases (debug)", () => {
+      const data = getActiveProjectsWithAliases();
+      console.table(data.map(p => ({
+        project: p.name,
+        aliases: p.aliases.join(", ") || "(none)",
+      })));
+    });
+    add("Auto-Attribute: show ALL aliased entities (debug)", () => {
+      const data = getAllEntitiesWithAliases();
+      console.table(data.map(e => ({
+        page: e.name,
+        aliases: e.aliases.join(", "),
+      })));
+    });
   }
 
   /* ---------- init ---------- */
