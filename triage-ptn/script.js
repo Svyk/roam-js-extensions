@@ -1,3 +1,6 @@
+/* triage-ptn v1.0.5 — same fence-collision fix as auto-attribute-todo v1.0.5
+ * (triple-backticks in regex source were breaking the outer Roam code block).
+ */
 /* triage-ptn v1.0.4 — log entries use plain [uid] text instead of ((uid)) refs
  * (avoids polluting source-block backlink count). Same change as auto-attribute-todo v1.0.4.
  */
@@ -17,7 +20,7 @@
  * Requires: Live AI Assistant with "Enable Public API" toggled ON.
  */
 ;(function () {
-  const VERSION = "1.0.4";
+  const VERSION = "1.0.5";
   const NAMESPACE = "triage-ptn";
   const TAG_PAGE = "ptn";
   const LOG_PAGE = "Triage PTN Log";
@@ -145,13 +148,18 @@ Use [[Time Block Constraints]] and [[Chief of Staff/Memory]] in your context to 
     }
   }
 
-  /* Robust JSON parse — handles raw JSON, ```json fences, ``` fences,
-   * and leading/trailing prose. Returns null on failure. */
+  /* Robust JSON parse — handles raw JSON, json-tag fences, plain fences,
+   * and leading/trailing prose. Returns null on failure.
+   * NOTE: triple-backticks built from ` escapes to avoid collision with
+   * the outer Roam code-block fence that wraps this entire script. */
   function parseJsonResponse(text) {
     if (!text || typeof text !== "string") return null;
     let s = text.trim();
-    if (s.startsWith("```")) {
-      s = s.replace(/^```(?:json|JSON)?\s*\n?/, "").replace(/\n?```\s*$/, "");
+    const FENCE = "`".repeat(3);  // built at runtime — no triple-backtick in source
+    if (s.startsWith(FENCE)) {
+      const re1 = new RegExp("^" + FENCE + "(?:json|JSON)?\\s*\\n?");
+      const re2 = new RegExp("\\n?" + FENCE + "\\s*$");
+      s = s.replace(re1, "").replace(re2, "");
     }
     try { return JSON.parse(s); } catch {}
     const m = s.match(/\{[\s\S]*\}/);

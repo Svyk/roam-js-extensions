@@ -1,4 +1,9 @@
-/* auto-attribute-todo v1.0.4
+/* auto-attribute-todo v1.0.5
+ *
+ * v1.0.5 — fix script source containing literal triple-backticks in regex
+ * patterns (those collide with the OUTER markdown fence when the script is
+ * stored in a Roam code block, breaking script execution mid-file). All
+ * triple-backticks in source replaced with Unicode-escaped equivalents.
  *
  * v1.0.4 — log entries no longer use ((uid)) Roam block-refs (was polluting
  * the source TODO's backlink count). Uses plain `[uid]` text instead.
@@ -22,10 +27,10 @@
  *
  * v1.0.2 — fix LLM result parsing: LiveAI's json_object mode requires a
  * `{"response": ...}` wrapper that we don't ask for. Switch to text mode +
- * robust manual parse (strips ```json fences if present).
+ * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.0.4";
+  const VERSION = "1.0.5";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -208,18 +213,23 @@ Active projects (case-sensitive): ${JSON.stringify(projects)}`;
     }
   }
 
-  /* Robust JSON parse — handles raw JSON, ```json fences, ``` fences, and
-   * leading/trailing prose. Returns null on failure. */
+  /* Robust JSON parse — handles raw JSON, json-tag fences, plain fences, and
+   * leading/trailing prose. Returns null on failure.
+   * NOTE: triple-backticks built from ` escapes to avoid collision with
+   * the outer Roam code-block fence that wraps this entire script. */
   function parseJsonResponse(text) {
     if (!text || typeof text !== "string") return null;
     let s = text.trim();
-    // Strip markdown code fence
-    if (s.startsWith("```")) {
-      s = s.replace(/^```(?:json|JSON)?\s*\n?/, "").replace(/\n?```\s*$/, "");
+    const FENCE = "`".repeat(3);  // built at runtime so source has no triple-backtick
+    // Strip markdown code fence if present
+    if (s.startsWith(FENCE)) {
+      const re1 = new RegExp("^" + FENCE + "(?:json|JSON)?\\s*\\n?");
+      const re2 = new RegExp("\\n?" + FENCE + "\\s*$");
+      s = s.replace(re1, "").replace(re2, "");
     }
     // Try direct parse
     try { return JSON.parse(s); } catch {}
-    // Extract first {...} block (greedy match for nested braces)
+    // Extract first {...} block (greedy)
     const m = s.match(/\{[\s\S]*\}/);
     if (m) {
       try { return JSON.parse(m[0]); } catch {}

@@ -6,7 +6,7 @@
   "scripts": [
     {
       "name": "auto-attribute-todo",
-      "version": "1.0.4",
+      "version": "1.0.5",
       "namespace": "auto-attr-todo",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/auto-attribute-todo/script.js",
       "description": "Auto-fills BT_attr* on new {{[[TODO]]}} blocks via LiveAI_API.",
@@ -23,7 +23,7 @@
     },
     {
       "name": "triage-ptn",
-      "version": "1.0.4",
+      "version": "1.0.5",
       "namespace": "triage-ptn",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/triage-ptn/script.js",
       "description": "Classifies #ptn captures and proposes a route.",
