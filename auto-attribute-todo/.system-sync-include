@@ -1,0 +1,2 @@
+# Marker for system-sync auto-discovery — backs this dir up to ~/system-setup/roam-js-extensions/
+# Defaults exclude: __pycache__, .DS_Store, *.pyc, *.log, .venv, node_modules, .git, *.env, secrets
