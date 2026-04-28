@@ -1,4 +1,10 @@
-/* auto-attribute-todo v1.7.1
+/* auto-attribute-todo v1.7.2
+ *
+ * v1.7.2 — Gemini embedding model rotation. text-embedding-004 was retired;
+ * default is now gemini-embedding-001. Added a fallback chain
+ * (gemini-embedding-001 → text-embedding-005 → text-embedding-004) — on a
+ * 404, the script walks the chain and promotes the first working model to
+ * be the new default for the session. Self-heals when Google rotates models.
  *
  * v1.7.1 — Roam-native key input. Replaced window.prompt() with a graph page
  * `[[Auto-Attribute Settings]]` containing a `gemini_api_key:: <key>` block.
@@ -149,7 +155,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.7.1";
+  const VERSION = "1.7.2";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -181,7 +187,12 @@
     // ── Phase 3: semantic embedding ranker (v1.7.0) ─────────────────────────
     geminiApiKey: "",             // set via [[Auto-Attribute Settings]] page block
     useEmbeddings: false,         // gated until key is set + manually enabled
-    embeddingModel: "text-embedding-004", // Gemini's current embedding model
+    embeddingModel: "gemini-embedding-001", // Gemini's current embedding model
+    embeddingModelFallbacks: [          // tried in order on 404 — handles model rotation
+      "gemini-embedding-001",
+      "text-embedding-005",
+      "text-embedding-004",
+    ],
     embeddingTopK: 5,             // top-K via cosine before LLM picks final
     embeddingProjectTextChars: 1500, // how much project page text to embed
     embeddingGraphWeight: 0.2,    // tie-breaker weight for graph-Jaccard signal
@@ -573,10 +584,7 @@
       .slice(0, 12);
   }
 
-  async function callGeminiEmbed(text) {
-    const key = state.settings.geminiApiKey;
-    if (!key) throw new Error("no Gemini API key — set via cmd palette");
-    const model = state.settings.embeddingModel;
+  async function callGeminiEmbedOne(text, model, key) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${encodeURIComponent(key)}`;
     const resp = await fetch(url, {
       method: "POST",
@@ -588,14 +596,50 @@
     });
     if (!resp.ok) {
       const errText = await resp.text();
-      throw new Error(`Gemini embed ${resp.status}: ${errText.slice(0, 200)}`);
+      const err = new Error(`Gemini embed ${resp.status}: ${errText.slice(0, 200)}`);
+      err.status = resp.status;
+      err.model = model;
+      throw err;
     }
     const data = await resp.json();
     const vec = data?.embedding?.values;
     if (!Array.isArray(vec) || vec.length === 0) {
-      throw new Error("Gemini returned empty embedding");
+      throw new Error(`Gemini ${model} returned empty embedding`);
     }
     return vec;
+  }
+
+  async function callGeminiEmbed(text) {
+    const key = state.settings.geminiApiKey;
+    if (!key) throw new Error("no Gemini API key — set via cmd palette");
+    // Try the configured model first, then fall back through the chain.
+    // Cache whichever works so we stop retrying dead ones.
+    const tried = [];
+    const candidates = [
+      state.settings.embeddingModel,
+      ...state.settings.embeddingModelFallbacks.filter(m => m !== state.settings.embeddingModel),
+    ];
+    let lastErr;
+    for (const model of candidates) {
+      if (tried.includes(model)) continue;
+      tried.push(model);
+      try {
+        const vec = await callGeminiEmbedOne(text, model, key);
+        // First success — promote this model to the new default
+        if (state.settings.embeddingModel !== model) {
+          log("info", `Gemini embedding model updated: ${state.settings.embeddingModel} → ${model} (auto-detected)`);
+          state.settings.embeddingModel = model;
+        }
+        return vec;
+      } catch (e) {
+        lastErr = e;
+        // 404 = model retired/missing → try next. Other errors (401, 429,
+        // 5xx) are not model-rotation problems, fail fast.
+        if (e.status !== 404) break;
+        log("debug", `embed model ${model} 404, falling back`, e?.message?.slice(0, 100));
+      }
+    }
+    throw lastErr || new Error("Gemini embed: all models failed");
   }
 
   function cosineSim(a, b) {
