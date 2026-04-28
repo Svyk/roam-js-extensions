@@ -1,10 +1,39 @@
-/* auto-attribute-todo v1.7.2
+/* auto-attribute-todo v1.7.3
+ *
+ * v1.7.3 — THREE fixes from real-world breakage:
+ *   (a) **Ghost cmd palette commands**. Roam doesn't unregister cmd palette
+ *       commands when you re-paste a roam/js block — the OLD version's
+ *       commands (closure over old state) keep firing alongside the new
+ *       ones. Symptom: rebuild command kept hitting text-embedding-004
+ *       even after v1.7.2 was pasted, because v1.7.1's command was still
+ *       wired up. Fix: registerCommands now calls removeCommand before
+ *       addCommand for each label (idempotent). And init() auto-calls the
+ *       previous version's cleanup() if a window namespace marker exists.
+ *   (b) **Duplicate BT_attr children** (e.g. two BT_attrDue, two
+ *       BT_attrPriority on the same TODO). Caused by parallel attribute()
+ *       runs from ghost commands + race between debounce-fire and pull-
+ *       watch-fire. Three-layer fix: (1) processedToday lock at very top of
+ *       processBlock; (2) re-fetch + re-check hasBTProject after LLM call,
+ *       before insertAttrs; (3) insertAttrs skips any BT_attrX:: key that
+ *       already exists as a child. Plus new cmd palette command "dedupe
+ *       BT_attr children (cleanup)" to scrub existing duplicates from the
+ *       graph in one pass.
+ *   (c) **Embedding model auto-discovery**. The hardcoded fallback chain
+ *       could go fully stale if Google rotates ALL listed models at once.
+ *       Added discoverEmbeddingModels() that calls
+ *       https://generativelanguage.googleapis.com/v1beta/models?key=... and
+ *       filters for supportedGenerationMethods includes embedContent. On
+ *       any 404 from callGeminiEmbed, the script discovers what's actually
+ *       available, repopulates embeddingModelFallbacks from that list, and
+ *       retries. Self-heals across any future Gemini model rotation without
+ *       a code change. New cmd palette command "discover available
+ *       embedding models" surfaces the live list for debugging.
  *
  * v1.7.2 — Gemini embedding model rotation. text-embedding-004 was retired;
  * default is now gemini-embedding-001. Added a fallback chain
  * (gemini-embedding-001 → text-embedding-005 → text-embedding-004) — on a
  * 404, the script walks the chain and promotes the first working model to
- * be the new default for the session. Self-heals when Google rotates models.
+ * be the new default for the session.
  *
  * v1.7.1 — Roam-native key input. Replaced window.prompt() with a graph page
  * `[[Auto-Attribute Settings]]` containing a `gemini_api_key:: <key>` block.
@@ -155,7 +184,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.7.2";
+  const VERSION = "1.7.3";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -609,37 +638,84 @@
     return vec;
   }
 
+  /* v1.7.3: list models from Google's API and filter for embedContent
+   * support. Self-heals across model rotations: if every model in our
+   * hardcoded fallback chain is dead, this finds whatever's currently
+   * available and updates the chain. */
+  async function discoverEmbeddingModels() {
+    const key = state.settings.geminiApiKey;
+    if (!key) throw new Error("no Gemini API key");
+    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      const err = await resp.text();
+      throw new Error(`listModels ${resp.status}: ${err.slice(0, 200)}`);
+    }
+    const data = await resp.json();
+    const models = (data?.models || [])
+      .filter(m => Array.isArray(m.supportedGenerationMethods)
+        && m.supportedGenerationMethods.includes("embedContent"))
+      .map(m => (m.name || "").replace(/^models\//, ""))
+      .filter(Boolean);
+    return models;
+  }
+
   async function callGeminiEmbed(text) {
     const key = state.settings.geminiApiKey;
     if (!key) throw new Error("no Gemini API key — set via cmd palette");
     // Try the configured model first, then fall back through the chain.
-    // Cache whichever works so we stop retrying dead ones.
-    const tried = [];
+    const tryChain = async (models) => {
+      const tried = [];
+      let lastErr;
+      for (const model of models) {
+        if (tried.includes(model)) continue;
+        tried.push(model);
+        try {
+          const vec = await callGeminiEmbedOne(text, model, key);
+          if (state.settings.embeddingModel !== model) {
+            log("info", `Gemini embedding model updated: ${state.settings.embeddingModel} → ${model} (auto-detected)`);
+            state.settings.embeddingModel = model;
+          }
+          return { vec, lastErr: null, tried };
+        } catch (e) {
+          lastErr = e;
+          if (e.status !== 404) return { vec: null, lastErr, tried };
+          log("debug", `embed model ${model} 404, falling back`, e?.message?.slice(0, 100));
+        }
+      }
+      return { vec: null, lastErr, tried };
+    };
+
     const candidates = [
       state.settings.embeddingModel,
       ...state.settings.embeddingModelFallbacks.filter(m => m !== state.settings.embeddingModel),
     ];
-    let lastErr;
-    for (const model of candidates) {
-      if (tried.includes(model)) continue;
-      tried.push(model);
+    let result = await tryChain(candidates);
+    if (result.vec) return result.vec;
+
+    // If everything in the hardcoded chain 404'd, Google rotated all of
+    // them. Discover what's actually available and try again.
+    if (result.lastErr?.status === 404) {
       try {
-        const vec = await callGeminiEmbedOne(text, model, key);
-        // First success — promote this model to the new default
-        if (state.settings.embeddingModel !== model) {
-          log("info", `Gemini embedding model updated: ${state.settings.embeddingModel} → ${model} (auto-detected)`);
-          state.settings.embeddingModel = model;
+        log("warn", "all hardcoded embedding models 404 — discovering live list...");
+        const discovered = await discoverEmbeddingModels();
+        if (discovered.length > 0) {
+          const newChain = discovered.filter(m => !result.tried.includes(m));
+          log("info", `discovered ${discovered.length} embedding models; trying ${newChain.length} new ones: ${newChain.join(", ")}`);
+          if (newChain.length > 0) {
+            state.settings.embeddingModelFallbacks = discovered;
+            const result2 = await tryChain(newChain);
+            if (result2.vec) return result2.vec;
+            result = result2;
+          }
+        } else {
+          log("warn", "no embedding models found in API listModels response");
         }
-        return vec;
       } catch (e) {
-        lastErr = e;
-        // 404 = model retired/missing → try next. Other errors (401, 429,
-        // 5xx) are not model-rotation problems, fail fast.
-        if (e.status !== 404) break;
-        log("debug", `embed model ${model} 404, falling back`, e?.message?.slice(0, 100));
+        log("warn", "discoverEmbeddingModels failed", e?.message || e);
       }
     }
-    throw lastErr || new Error("Gemini embed: all models failed");
+    throw result.lastErr || new Error("Gemini embed: all models failed");
   }
 
   function cosineSim(a, b) {
@@ -1536,16 +1612,40 @@ ${entityListLines}${correctionsBlock}`;
       : "auto-attributed";
     const confSuffix = lowConf ? ` (low conf ${attrs.confidence.toFixed(2)} — verify)` : "";
     blocks.push(`BT_attrNotes:: ${userNotes}${confSuffix}`);
+    // v1.7.3: dedupe against existing BT_attr children. If the parent
+    // already has BT_attrPriority::, don't add another. Last-line defense
+    // against duplicate creation in race conditions.
+    const existing = window.roamAlphaAPI.data.pull(
+      "[{:block/children [:block/string]}]",
+      [":block/uid", parentUid]
+    );
+    const existingKeys = new Set();
+    for (const c of (existing?.[":block/children"] || [])) {
+      const m = (c[":block/string"] || "").match(/^(BT_attr[A-Za-z]+)::/);
+      if (m) existingKeys.add(m[1]);
+    }
+    const blocksToCreate = blocks.filter(b => {
+      const m = b.match(/^(BT_attr[A-Za-z]+)::/);
+      if (!m) return true;
+      if (existingKeys.has(m[1])) {
+        log("debug", `skipping ${m[1]} — already exists on ${parentUid}`);
+        return false;
+      }
+      return true;
+    });
     // Track block UIDs we create — specifically the BT_attrProject one
     // gets a correction-learning watcher.
     const createdUids = [];
-    for (let i = 0; i < blocks.length; i++) {
+    for (let i = 0; i < blocksToCreate.length; i++) {
       const newUid = window.roamAlphaAPI.util.generateUID();
       await window.roamAlphaAPI.data.block.create({
         location: { "parent-uid": parentUid, order: i },
-        block: { uid: newUid, string: blocks[i] },
+        block: { uid: newUid, string: blocksToCreate[i] },
       });
-      createdUids.push({ uid: newUid, str: blocks[i] });
+      createdUids.push({ uid: newUid, str: blocksToCreate[i] });
+    }
+    if (blocksToCreate.length < blocks.length) {
+      log("info", `[${parentUid}] inserted ${blocksToCreate.length}/${blocks.length} attrs (dedup skipped ${blocks.length - blocksToCreate.length})`);
     }
     // Register correction watcher on the BT_attrProject block (if present)
     if (attrs.project) {
@@ -1661,6 +1761,15 @@ ${entityListLines}${correctionsBlock}`;
       await logToRoam(uid, attrs, "suggestion-only");
       return;
     }
+    // v1.7.3: race-window guard. The LLM call took ~5s. In that window
+    // another runner (parallel scan, ghost cmd from re-paste, pull-watch fire)
+    // may have already attributed this TODO. Re-fetch and skip if so.
+    const dataAfter = getBlock(uid);
+    if (dataAfter && hasBTProject(dataAfter)) {
+      log("info", `[${uid}] already has BT_attrProject after LLM call — skipping insert (race avoided)`);
+      await logToRoam(uid, attrs, "race-skipped");
+      return;
+    }
     try {
       await insertAttrs(uid, attrs, text);
       await logToRoam(uid, attrs, null);
@@ -1745,9 +1854,16 @@ ${entityListLines}${correctionsBlock}`;
 
   /* ---------- command palette ---------- */
   function registerCommands() {
+    // Idempotent: removeCommand first so re-pasting the script REPLACES old
+    // commands (which closure over stale state) instead of doubling them up.
+    // Track labels we register so cleanup() can also remove them later.
+    state.registeredCommandLabels = state.registeredCommandLabels || new Set();
     const add = (label, callback) => {
-      try { window.roamAlphaAPI.ui.commandPalette.addCommand({ label, callback }); }
-      catch (e) { log("warn", `add cmd failed: ${label}`, e); }
+      try { window.roamAlphaAPI.ui.commandPalette.removeCommand({ label }); } catch {}
+      try {
+        window.roamAlphaAPI.ui.commandPalette.addCommand({ label, callback });
+        state.registeredCommandLabels.add(label);
+      } catch (e) { log("warn", `add cmd failed: ${label}`, e); }
     };
     add("Auto-Attribute: process focused TODO now", async () => {
       const f = window.roamAlphaAPI.ui.getFocusedBlock();
@@ -1938,6 +2054,77 @@ ${entityListLines}${correctionsBlock}`;
         log("error", "show cache failed", e);
       }
     });
+    add("Auto-Attribute: dedupe BT_attr children (cleanup duplicates)", async () => {
+      // Scan all TODOs; for each, if it has multiple BT_attrX:: children with
+      // the same key, delete all but the first. Reports counts.
+      try {
+        const rows = window.roamAlphaAPI.data.q(`
+          [:find ?uid
+           :where
+           [?b :block/uid ?uid]
+           [?b :block/string ?s]
+           [(clojure.string/includes? ?s "{{[[TODO]]}}")]]
+        `);
+        const todoUids = rows.flat();
+        if (!confirm(`Scan ${todoUids.length} TODOs for duplicate BT_attr children and delete the duplicates?\n\nKeeps the FIRST occurrence of each BT_attrX:: key, deletes the rest. Reversible by undo (Cmd+Z).`)) return;
+        let scanned = 0, todosFixed = 0, blocksDeleted = 0;
+        for (const uid of todoUids) {
+          scanned++;
+          const data = window.roamAlphaAPI.data.pull(
+            "[{:block/children [:block/uid :block/string :block/order]}]",
+            [":block/uid", uid]
+          );
+          const children = (data?.[":block/children"] || [])
+            .slice()
+            .sort((a, b) => (a[":block/order"] || 0) - (b[":block/order"] || 0));
+          const seenKeys = new Set();
+          const toDelete = [];
+          for (const c of children) {
+            const m = (c[":block/string"] || "").match(/^(BT_attr[A-Za-z]+)::/);
+            if (!m) continue;
+            const key = m[1];
+            if (seenKeys.has(key)) {
+              toDelete.push(c[":block/uid"]);
+            } else {
+              seenKeys.add(key);
+            }
+          }
+          if (toDelete.length === 0) continue;
+          for (const dUid of toDelete) {
+            try {
+              await window.roamAlphaAPI.data.block.delete({ block: { uid: dUid } });
+              blocksDeleted++;
+            } catch (e) {
+              log("warn", `delete dupe ${dUid} failed`, e?.message || e);
+            }
+          }
+          todosFixed++;
+        }
+        const msg = `Scanned ${scanned} TODOs, fixed ${todosFixed}, deleted ${blocksDeleted} duplicate BT_attr blocks.`;
+        log("info", msg);
+        alert(msg);
+      } catch (e) {
+        log("error", "dedupe failed", e);
+        alert("Dedupe failed: " + e.message);
+      }
+    });
+    add("Auto-Attribute: discover available embedding models (debug)", async () => {
+      try {
+        const models = await discoverEmbeddingModels();
+        if (!models.length) {
+          alert("Google's API returned NO embedding-capable models for your key. Either the key is invalid or the embedContent endpoint is unavailable.");
+          return;
+        }
+        console.log("[auto-attr-todo] embedding-capable models:");
+        for (const m of models) console.log("  -", m);
+        alert(`Found ${models.length} embedding model(s):\n\n${models.join("\n")}\n\nFallback chain has been refreshed. Run \"rebuild all embeddings\" to retry with the discovered list.`);
+        state.settings.embeddingModelFallbacks = models;
+        if (models.length > 0) state.settings.embeddingModel = models[0];
+      } catch (e) {
+        log("error", "discover failed", e);
+        alert("Discover failed: " + e.message);
+      }
+    });
     add("Auto-Attribute: show stats", () => {
       log("info", "stats", {
         version: VERSION,
@@ -1995,6 +2182,19 @@ ${entityListLines}${correctionsBlock}`;
   /* ---------- init ---------- */
   function init() {
     log("info", `v${VERSION} starting`);
+    // v1.7.3: kill any prior version of this script that's still running in
+    // this tab (re-paste of roam/js block leaves old timers, watchers, and
+    // cmd palette commands alive — they closure over old state and double
+    // every action). Detect via window namespace marker.
+    const priorCleanup = window[`${NAMESPACE}_cleanup`];
+    if (typeof priorCleanup === "function") {
+      try {
+        priorCleanup();
+        log("info", "cleaned up prior version's timers/watchers/commands");
+      } catch (e) {
+        log("warn", "prior cleanup threw, continuing anyway", e?.message || e);
+      }
+    }
     if (!window.LiveAI_API?.isAvailable()) {
       log("warn", "LiveAI_API not available yet — script will start, calls will fail until LiveAI loads with the public API enabled. Toggle on in LiveAI settings.");
     } else {
@@ -2030,6 +2230,14 @@ ${entityListLines}${correctionsBlock}`;
       if (info.watcherCb) {
         try { window.roamAlphaAPI.data.removePullWatch("[:block/string]", [":block/uid", uid], info.watcherCb); } catch {}
       }
+    }
+    // v1.7.3: also unregister cmd palette commands so they don't pile up
+    // when the script is re-pasted multiple times.
+    if (state.registeredCommandLabels) {
+      for (const label of state.registeredCommandLabels) {
+        try { window.roamAlphaAPI.ui.commandPalette.removeCommand({ label }); } catch {}
+      }
+      state.registeredCommandLabels.clear();
     }
     log("info", "cleaned up");
   }
