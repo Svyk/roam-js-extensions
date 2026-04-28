@@ -1,4 +1,25 @@
-/* auto-attribute-todo v1.6.0
+/* auto-attribute-todo v1.7.0
+ *
+ * v1.7.0 — Phase 3: semantic embedding ranker. Projects + TODOs are embedded
+ * via Gemini text-embedding-004 (768-dim). On each TODO process, the script
+ * embeds the TODO text + breadcrumb, cosine-sims against cached project
+ * embeddings, and feeds the top-K (default 5) to the LLM as the candidate
+ * list — replacing graph-Jaccard pre-ranking when embeddings are available
+ * (graph-Jaccard score is preserved as a tie-breaker, weight 0.2). Catches
+ * semantic relevance that lexical/Jaccard methods miss (e.g. a TODO about
+ * "running an audit" matches a project tagged "compliance review" even with
+ * no shared page-refs). Cache: IndexedDB keyed by project page name +
+ * SHA-256 short hash of (aliases + page text); stale cache auto-refreshes
+ * on hash mismatch during the 15-min scan cycle. Gracefully falls back to
+ * v1.6.0 graph-Jaccard if no Gemini key is set, embeddings disabled, network
+ * fails, or Gemini quota hits — Phase 3 is purely additive. Setup: cmd
+ * palette → "Auto-Attribute: set Gemini API key" → paste, then enable via
+ * "toggle embeddings (Phase 3)". Settings persist in localStorage.
+ *   Architecture decision: Gemini direct API (768-dim, ~$0 ongoing on free
+ * tier 1500 RPD) over TF.js Universal Sentence Encoder. Avoids 10MB model
+ * download, avoids 30-50MB JS heap pressure, identical browser+desktop+
+ * mobile behavior. LiveAI doesn't proxy embeddings (verified 2026-04-27);
+ * user supplies their own Gemini key.
  *
  * v1.6.0 — Project lifecycle commands. Archive a project (sets
  * Project Status:: Archive, auto-removes from dropdown), unarchive (flip
@@ -121,7 +142,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.6.0";
+  const VERSION = "1.7.0";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -150,6 +171,13 @@
     correctionsPage: "Auto-Attribute Corrections",
     fewShotCorrectionsCount: 10,  // how many recent corrections to include in LLM prompt
     graphJaccardTopK: 10,         // how many graph-pre-ranked projects to send to LLM
+    // ── Phase 3: semantic embedding ranker (v1.7.0) ─────────────────────────
+    geminiApiKey: "",             // set via cmd palette; empty = embeddings off
+    useEmbeddings: false,         // gated until key is set + manually enabled
+    embeddingModel: "text-embedding-004", // Gemini's current embedding model
+    embeddingTopK: 5,             // top-K via cosine before LLM picks final
+    embeddingProjectTextChars: 1500, // how much project page text to embed
+    embeddingGraphWeight: 0.2,    // tie-breaker weight for graph-Jaccard signal
   };
 
   const state = {
@@ -162,6 +190,10 @@
     scanTimer: null,
     projectsCreatedToday: 0,
     trackedAttributions: {},     // {btProjUid: {todoUid, originalPick, todoText, watcherCb}}
+    // ── Phase 3 state ─────────────────────────────────────────────────────
+    projectEmbeddings: new Map(), // projectName → Float-array vector (in-mem cache)
+    idbConn: null,                // cached IndexedDB connection
+    embedsBootstrapped: false,
   };
 
   /* ---------- helpers ---------- */
@@ -184,6 +216,31 @@
       date: new Date().toDateString(),
       uids: Array.from(state.processedToday),
     }));
+  }
+
+  /* ── Phase 3: persistent settings (geminiApiKey, useEmbeddings) ────────── */
+  function loadPersistentSettings() {
+    try {
+      const raw = localStorage.getItem(sk("settings"));
+      if (!raw) return;
+      const stored = JSON.parse(raw);
+      // Only restore the Phase 3 toggles + key — DEFAULTS owns the rest
+      if (typeof stored.geminiApiKey === "string") state.settings.geminiApiKey = stored.geminiApiKey;
+      if (typeof stored.useEmbeddings === "boolean") state.settings.useEmbeddings = stored.useEmbeddings;
+    } catch (e) {
+      log("warn", "loadPersistentSettings failed", e);
+    }
+  }
+
+  function persistSettings() {
+    try {
+      localStorage.setItem(sk("settings"), JSON.stringify({
+        geminiApiKey: state.settings.geminiApiKey,
+        useEmbeddings: state.settings.useEmbeddings,
+      }));
+    } catch (e) {
+      log("warn", "persistSettings failed", e);
+    }
   }
 
   function resetCallsIfNewDay() {
@@ -361,6 +418,246 @@
         return { ...p, graphScore: jaccard(todoRefs, projRefs) };
       })
       .sort((a, b) => b.graphScore - a.graphScore);
+  }
+
+  /* ---------- Phase 3: Semantic embedding ranker (v1.7.0) ----------
+   * Embed each active project once via Gemini text-embedding-004 (768-dim),
+   * cache in IndexedDB by name + content hash. On each TODO, embed the TODO
+   * text + breadcrumb, cosine-sim against cached project vectors, take top-K.
+   * Combines with graph-Jaccard (weight 0.2) for tie-breaking. Falls back
+   * silently to Phase 2 if no key, network error, or quota hit. */
+
+  const IDB_NAME = "auto-attr-embeddings-v1";
+  const IDB_STORE = "projects";
+
+  function openEmbedDB() {
+    if (state.idbConn) return Promise.resolve(state.idbConn);
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE, { keyPath: "name" });
+      req.onsuccess = () => { state.idbConn = req.result; resolve(state.idbConn); };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function idbReq(mode, op) {
+    return openEmbedDB().then(db => new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, mode);
+      const store = tx.objectStore(IDB_STORE);
+      const req = op(store);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    }));
+  }
+
+  const idbGetEmbed = (name) => idbReq("readonly", s => s.get(name));
+  const idbPutEmbed = (record) => idbReq("readwrite", s => s.put(record));
+  const idbGetAllEmbeds = () => idbReq("readonly", s => s.getAll());
+  const idbDeleteEmbed = (name) => idbReq("readwrite", s => s.delete(name));
+
+  async function sha256Short(s) {
+    const buf = new TextEncoder().encode(s || "");
+    const hash = await crypto.subtle.digest("SHA-256", buf);
+    return Array.from(new Uint8Array(hash))
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join("")
+      .slice(0, 12);
+  }
+
+  async function callGeminiEmbed(text) {
+    const key = state.settings.geminiApiKey;
+    if (!key) throw new Error("no Gemini API key — set via cmd palette");
+    const model = state.settings.embeddingModel;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${encodeURIComponent(key)}`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: `models/${model}`,
+        content: { parts: [{ text }] },
+      }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Gemini embed ${resp.status}: ${errText.slice(0, 200)}`);
+    }
+    const data = await resp.json();
+    const vec = data?.embedding?.values;
+    if (!Array.isArray(vec) || vec.length === 0) {
+      throw new Error("Gemini returned empty embedding");
+    }
+    return vec;
+  }
+
+  function cosineSim(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    let dot = 0, ma = 0, mb = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      ma += a[i] * a[i];
+      mb += b[i] * b[i];
+    }
+    if (ma === 0 || mb === 0) return 0;
+    return dot / (Math.sqrt(ma) * Math.sqrt(mb));
+  }
+
+  function buildProjectEmbedText(projectName, aliases) {
+    const safeName = projectName.replaceAll('"', '\\"');
+    let blocks = [];
+    try {
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?s
+         :where
+         [?p :node/title "${safeName}"]
+         [?b :block/page ?p]
+         [?b :block/string ?s]]
+      `);
+      blocks = rows.flat().filter(s => s && s.length > 0);
+    } catch (e) {
+      log("debug", `buildProjectEmbedText failed for ${projectName}`, e);
+    }
+    const aliasLine = aliases?.length ? `Aliases: ${aliases.join(", ")}` : "";
+    const parts = [projectName, aliasLine, ...blocks].filter(Boolean);
+    return parts.join("\n").slice(0, state.settings.embeddingProjectTextChars);
+  }
+
+  async function ensureProjectEmbedding(projectName, aliases) {
+    const text = buildProjectEmbedText(projectName, aliases);
+    const hash = await sha256Short(text);
+    let cached;
+    try { cached = await idbGetEmbed(projectName); } catch (e) {
+      log("debug", `idbGet failed for ${projectName}`, e);
+    }
+    if (cached && cached.hash === hash && Array.isArray(cached.vector)) {
+      state.projectEmbeddings.set(projectName, cached.vector);
+      return cached.vector;
+    }
+    const vector = await callGeminiEmbed(text);
+    try {
+      await idbPutEmbed({ name: projectName, hash, vector, ts: Date.now(), aliases: aliases || [] });
+    } catch (e) {
+      log("warn", `idbPut failed for ${projectName}`, e);
+    }
+    state.projectEmbeddings.set(projectName, vector);
+    return vector;
+  }
+
+  async function bootstrapEmbeddings() {
+    if (!state.settings.useEmbeddings || !state.settings.geminiApiKey) return;
+    if (state.embedsBootstrapped) return;
+    state.embedsBootstrapped = true;
+    const projects = getActiveProjectsWithAliases();
+    log("info", `bootstrapping embeddings for ${projects.length} active projects...`);
+    let ok = 0, fail = 0, skip = 0;
+    for (const p of projects) {
+      try {
+        const cachedBefore = state.projectEmbeddings.has(p.name);
+        await ensureProjectEmbedding(p.name, p.aliases);
+        if (cachedBefore) skip++; else ok++;
+      } catch (e) {
+        log("warn", `embed bootstrap failed for ${p.name}`, e?.message || e);
+        fail++;
+      }
+      // Throttle 100ms between calls — Gemini free tier handles 10 RPS easily
+      await new Promise(r => setTimeout(r, 100));
+    }
+    log("info", `embeddings bootstrap done: ${ok} new, ${skip} cached, ${fail} failed`);
+  }
+
+  async function refreshEmbeddingsIfStale() {
+    if (!state.settings.useEmbeddings || !state.settings.geminiApiKey) return;
+    const projects = getActiveProjectsWithAliases();
+    let refreshed = 0, removed = 0;
+    // Refresh stale (hash mismatch) for current active projects
+    for (const p of projects) {
+      const text = buildProjectEmbedText(p.name, p.aliases);
+      const hash = await sha256Short(text);
+      let cached;
+      try { cached = await idbGetEmbed(p.name); } catch {}
+      if (!cached || cached.hash !== hash) {
+        try {
+          await ensureProjectEmbedding(p.name, p.aliases);
+          refreshed++;
+          await new Promise(r => setTimeout(r, 100));
+        } catch (e) {
+          log("debug", `stale-refresh failed for ${p.name}`, e?.message || e);
+        }
+      }
+    }
+    // GC: remove embeddings for projects that are no longer active
+    try {
+      const all = await idbGetAllEmbeds();
+      const activeNames = new Set(projects.map(p => p.name));
+      for (const rec of all) {
+        if (!activeNames.has(rec.name)) {
+          await idbDeleteEmbed(rec.name);
+          state.projectEmbeddings.delete(rec.name);
+          removed++;
+        }
+      }
+    } catch (e) {
+      log("debug", "embedding GC failed", e);
+    }
+    if (refreshed > 0 || removed > 0) {
+      log("info", `embeddings refresh: ${refreshed} updated, ${removed} GC'd`);
+    }
+  }
+
+  function buildTodoEmbedText(uid, text) {
+    let breadcrumb = "";
+    try {
+      const data = window.roamAlphaAPI.data.pull(
+        "[{:block/parents [:block/string]}]",
+        [":block/uid", uid]
+      );
+      const parents = data?.[":block/parents"] || [];
+      breadcrumb = parents
+        .map(p => (p[":block/string"] || "").slice(0, 200))
+        .filter(Boolean)
+        .join(" > ");
+    } catch {}
+    return breadcrumb ? `${breadcrumb}\n${text}` : text;
+  }
+
+  async function rankProjectsByEmbeddings(todoUid, todoText, projects) {
+    if (!state.settings.useEmbeddings || !state.settings.geminiApiKey) return null;
+    if (!projects.length) return null;
+
+    const embedInput = buildTodoEmbedText(todoUid, todoText);
+    let todoVec;
+    try {
+      todoVec = await callGeminiEmbed(embedInput);
+    } catch (e) {
+      log("warn", "TODO embed failed — falling back to graph-Jaccard", e?.message || e);
+      return null;
+    }
+
+    // Score each project using cached vector; lazy-fill any missing
+    const scored = await Promise.all(projects.map(async p => {
+      let projVec = state.projectEmbeddings.get(p.name);
+      if (!projVec) {
+        try {
+          projVec = await ensureProjectEmbedding(p.name, p.aliases);
+        } catch (e) {
+          log("debug", `lazy embed failed for ${p.name}`, e?.message || e);
+          projVec = null;
+        }
+      }
+      const embedScore = projVec ? cosineSim(todoVec, projVec) : 0;
+      return { ...p, embedScore };
+    }));
+
+    // Combine with graph-Jaccard for tie-breaking
+    const todoRefs = collectTodoContextRefs(todoUid);
+    const w = state.settings.embeddingGraphWeight;
+    return scored
+      .map(p => {
+        const graphScore = todoRefs.size > 0
+          ? jaccard(todoRefs, collectProjectPageRefs(p.name))
+          : 0;
+        return { ...p, graphScore, combinedScore: (1 - w) * p.embedScore + w * graphScore };
+      })
+      .sort((a, b) => b.combinedScore - a.combinedScore);
   }
 
   /* ---------- Correction learning (Phase 2) ----------
@@ -803,16 +1100,32 @@
     }
 
     const projectsDataRaw = getActiveProjectsWithAliases();
-    // Phase 2: pre-rank by graph-Jaccard similarity to TODO context
-    const projectsRanked = rankProjectsByGraphSignal(uid, projectsDataRaw);
-    // Take top-K by graph score, but always include alias-matching projects
-    // (handled by LLM since aliases are passed). Top-K cap keeps prompt small.
-    const topK = Math.min(state.settings.graphJaccardTopK, projectsRanked.length);
+    // Phase 3: try semantic embedding ranker first; falls back to Phase 2 if
+    // disabled, no key, or network/quota error.
+    const embedRanked = await rankProjectsByEmbeddings(uid, text, projectsDataRaw);
+    let projectsRanked;
+    let rankerUsed;
+    if (embedRanked) {
+      projectsRanked = embedRanked;
+      rankerUsed = "embedding";
+    } else {
+      // Phase 2 fallback: graph-Jaccard pre-ranking
+      projectsRanked = rankProjectsByGraphSignal(uid, projectsDataRaw);
+      rankerUsed = "graph-jaccard";
+    }
+    // Top-K cap keeps prompt small. Phase 3 uses tighter K (5) since cosine
+    // is more discriminative than Jaccard.
+    const topK = rankerUsed === "embedding"
+      ? Math.min(state.settings.embeddingTopK, projectsRanked.length)
+      : Math.min(state.settings.graphJaccardTopK, projectsRanked.length);
     const projectsData = projectsRanked.slice(0, topK);
     const projectListLines = projectsData.map(p => {
-      const scoreNote = p.graphScore > 0
-        ? ` [graph-similarity: ${p.graphScore.toFixed(2)}]`
-        : "";
+      const parts = [];
+      if (typeof p.embedScore === "number" && p.embedScore > 0) {
+        parts.push(`semantic: ${p.embedScore.toFixed(2)}`);
+      }
+      if (p.graphScore > 0) parts.push(`graph: ${p.graphScore.toFixed(2)}`);
+      const scoreNote = parts.length ? ` [${parts.join(", ")}]` : "";
       return p.aliases.length
         ? `- "${p.name}" (aliases: ${p.aliases.join(", ")})${scoreNote}`
         : `- "${p.name}"${scoreNote}`;
@@ -1217,6 +1530,8 @@ ${entityListLines}${correctionsBlock}`;
       if (state.settings.syncHubOnScan) {
         syncActiveProjectsHub().catch(e => log("warn", "hub sync failed", e));
       }
+      // Phase 3: refresh stale embeddings + GC removed projects every cycle
+      refreshEmbeddingsIfStale().catch(e => log("warn", "embed refresh failed", e?.message || e));
       const uids = findAllTodos();
       let queued = 0;
       const budget = state.settings.scanBudgetPerCycle;
@@ -1376,6 +1691,99 @@ ${entityListLines}${correctionsBlock}`;
         alert("Bulk convert failed: " + e.message);
       }
     });
+    add("Auto-Attribute: set Gemini API key (Phase 3 embeddings)", () => {
+      const cur = state.settings.geminiApiKey;
+      const masked = cur ? `${cur.slice(0,6)}...${cur.slice(-4)}` : "(none)";
+      const next = prompt(`Paste your Gemini API key.\n\nGet a free key at https://aistudio.google.com/apikey — free tier covers 1500 RPD which is ample for this use.\n\nCurrent: ${masked}\n\nLeave blank + click OK to clear.`, "");
+      if (next === null) return;
+      state.settings.geminiApiKey = next.trim();
+      persistSettings();
+      if (state.settings.geminiApiKey) {
+        log("info", `Gemini key set (${state.settings.geminiApiKey.slice(0,6)}...${state.settings.geminiApiKey.slice(-4)})`);
+        if (state.settings.useEmbeddings) {
+          state.embedsBootstrapped = false;
+          bootstrapEmbeddings().catch(e => log("warn", "post-set bootstrap failed", e?.message || e));
+        } else {
+          alert("Key saved. Now enable embeddings via 'Auto-Attribute: toggle embeddings (Phase 3)'.");
+        }
+      } else {
+        log("info", "Gemini key cleared — embeddings disabled");
+        state.settings.useEmbeddings = false;
+        persistSettings();
+      }
+    });
+    add("Auto-Attribute: toggle embeddings (Phase 3)", () => {
+      if (!state.settings.geminiApiKey && !state.settings.useEmbeddings) {
+        alert("Set Gemini API key first via 'Auto-Attribute: set Gemini API key'.");
+        return;
+      }
+      state.settings.useEmbeddings = !state.settings.useEmbeddings;
+      persistSettings();
+      log("info", `useEmbeddings: ${state.settings.useEmbeddings}`);
+      if (state.settings.useEmbeddings) {
+        state.embedsBootstrapped = false;
+        bootstrapEmbeddings().catch(e => log("warn", "post-toggle bootstrap failed", e?.message || e));
+      }
+    });
+    add("Auto-Attribute: rebuild all embeddings (force refresh)", async () => {
+      if (!state.settings.geminiApiKey) {
+        alert("Set Gemini API key first.");
+        return;
+      }
+      const projects = getActiveProjectsWithAliases();
+      if (!confirm(`Rebuild embeddings for ${projects.length} active projects?\nThis will hit the Gemini API ${projects.length} times (~${Math.ceil(projects.length * 100 / 1000)}s, free tier).`)) return;
+      let ok = 0, fail = 0;
+      state.projectEmbeddings.clear();
+      for (const p of projects) {
+        try {
+          const text = buildProjectEmbedText(p.name, p.aliases);
+          const hash = await sha256Short(text);
+          const vector = await callGeminiEmbed(text);
+          await idbPutEmbed({ name: p.name, hash, vector, ts: Date.now(), aliases: p.aliases });
+          state.projectEmbeddings.set(p.name, vector);
+          ok++;
+        } catch (e) {
+          log("warn", `rebuild failed for ${p.name}`, e?.message || e);
+          fail++;
+        }
+        await new Promise(r => setTimeout(r, 100));
+      }
+      log("info", `rebuild done: ${ok} ok, ${fail} failed`);
+      alert(`Rebuilt ${ok} embeddings (${fail} failed). See console for details.`);
+    });
+    add("Auto-Attribute: show embedding-similarity for focused TODO (debug)", async () => {
+      const f = window.roamAlphaAPI.ui.getFocusedBlock();
+      if (!f) return log("info", "no focused block");
+      if (!state.settings.useEmbeddings || !state.settings.geminiApiKey) {
+        return log("info", "embeddings disabled or no key — enable first");
+      }
+      const data = getBlock(f["block-uid"]);
+      const text = data?.[":block/string"] || "";
+      const projects = getActiveProjectsWithAliases();
+      const ranked = await rankProjectsByEmbeddings(f["block-uid"], text, projects);
+      if (!ranked) return log("warn", "embedding ranker returned null — check console for error");
+      console.table(ranked.map(p => ({
+        project: p.name,
+        semantic: typeof p.embedScore === "number" ? p.embedScore.toFixed(3) : "n/a",
+        graph: p.graphScore?.toFixed(3) || "0.000",
+        combined: p.combinedScore?.toFixed(3) || "n/a",
+      })));
+    });
+    add("Auto-Attribute: show embeddings cache (debug)", async () => {
+      try {
+        const all = await idbGetAllEmbeds();
+        console.log(`[auto-attr-todo] ${all.length} cached embeddings:`);
+        console.table(all.map(rec => ({
+          project: rec.name,
+          dim: rec.vector?.length || 0,
+          hash: rec.hash,
+          aliases: (rec.aliases || []).join(", "),
+          age_min: ((Date.now() - rec.ts) / 60000).toFixed(0),
+        })));
+      } catch (e) {
+        log("error", "show cache failed", e);
+      }
+    });
     add("Auto-Attribute: show stats", () => {
       log("info", "stats", {
         version: VERSION,
@@ -1385,6 +1793,9 @@ ${entityListLines}${correctionsBlock}`;
         processedToday: state.processedToday.size,
         pending: state.pending.size,
         liveaiAvailable: !!window.LiveAI_API?.isAvailable(),
+        embeddingsEnabled: state.settings.useEmbeddings,
+        geminiKeySet: !!state.settings.geminiApiKey,
+        cachedEmbeddings: state.projectEmbeddings.size,
       });
     });
     add("Auto-Attribute: scan now", () => {
@@ -1436,6 +1847,7 @@ ${entityListLines}${correctionsBlock}`;
       log("info", `LiveAI default model: ${window.LiveAI_API.getDefaultModel()}`);
     }
     state.processedToday = loadProcessed();
+    loadPersistentSettings();  // Phase 3: rehydrate geminiApiKey + useEmbeddings
     registerCommands();
     startPullWatch();
     startScan();
@@ -1443,8 +1855,14 @@ ${entityListLines}${correctionsBlock}`;
     syncActiveProjectsHub().catch(e => log("warn", "initial hub sync failed", e));
     // Phase 2: rehydrate correction watchers from previous sessions
     rehydrateTracking();
+    // Phase 3: bootstrap embeddings if enabled (background, non-blocking)
+    if (state.settings.useEmbeddings && state.settings.geminiApiKey) {
+      bootstrapEmbeddings().catch(e => log("warn", "embed bootstrap failed", e?.message || e));
+    } else if (state.settings.useEmbeddings && !state.settings.geminiApiKey) {
+      log("warn", "embeddings enabled but no Gemini API key — falling back to graph-Jaccard. Set key via cmd palette.");
+    }
     window[`${NAMESPACE}_state`] = state;
-    log("info", `ready. ${state.processedToday.size} already processed today.`);
+    log("info", `ready. ${state.processedToday.size} already processed today. embeddings: ${state.settings.useEmbeddings && state.settings.geminiApiKey ? "ON" : "OFF"}`);
   }
 
   function cleanup() {
