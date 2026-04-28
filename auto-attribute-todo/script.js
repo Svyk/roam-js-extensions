@@ -1,4 +1,13 @@
-/* auto-attribute-todo v1.7.0
+/* auto-attribute-todo v1.7.1
+ *
+ * v1.7.1 — Roam-native key input. Replaced window.prompt() with a graph page
+ * `[[Auto-Attribute Settings]]` containing a `gemini_api_key:: <key>` block.
+ * Reason: Roam Desktop (Electron) blocks window.prompt() — the dialog never
+ * appears. The new flow opens the settings page in the right sidebar with a
+ * placeholder block; user pastes their key into the block; the script picks
+ * it up on next scan cycle (or instantly via "reload Gemini key from graph"
+ * cmd palette command). Settings persist in BOTH localStorage AND the graph
+ * — graph is source of truth, localStorage is cache for fast init.
  *
  * v1.7.0 — Phase 3: semantic embedding ranker. Projects + TODOs are embedded
  * via Gemini text-embedding-004 (768-dim). On each TODO process, the script
@@ -12,9 +21,7 @@
  * SHA-256 short hash of (aliases + page text); stale cache auto-refreshes
  * on hash mismatch during the 15-min scan cycle. Gracefully falls back to
  * v1.6.0 graph-Jaccard if no Gemini key is set, embeddings disabled, network
- * fails, or Gemini quota hits — Phase 3 is purely additive. Setup: cmd
- * palette → "Auto-Attribute: set Gemini API key" → paste, then enable via
- * "toggle embeddings (Phase 3)". Settings persist in localStorage.
+ * fails, or Gemini quota hits — Phase 3 is purely additive.
  *   Architecture decision: Gemini direct API (768-dim, ~$0 ongoing on free
  * tier 1500 RPD) over TF.js Universal Sentence Encoder. Avoids 10MB model
  * download, avoids 30-50MB JS heap pressure, identical browser+desktop+
@@ -142,7 +149,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.7.0";
+  const VERSION = "1.7.1";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -172,12 +179,13 @@
     fewShotCorrectionsCount: 10,  // how many recent corrections to include in LLM prompt
     graphJaccardTopK: 10,         // how many graph-pre-ranked projects to send to LLM
     // ── Phase 3: semantic embedding ranker (v1.7.0) ─────────────────────────
-    geminiApiKey: "",             // set via cmd palette; empty = embeddings off
+    geminiApiKey: "",             // set via [[Auto-Attribute Settings]] page block
     useEmbeddings: false,         // gated until key is set + manually enabled
     embeddingModel: "text-embedding-004", // Gemini's current embedding model
     embeddingTopK: 5,             // top-K via cosine before LLM picks final
     embeddingProjectTextChars: 1500, // how much project page text to embed
     embeddingGraphWeight: 0.2,    // tie-breaker weight for graph-Jaccard signal
+    settingsPage: "Auto-Attribute Settings", // graph page holding gemini_api_key:: block
   };
 
   const state = {
@@ -241,6 +249,107 @@
     } catch (e) {
       log("warn", "persistSettings failed", e);
     }
+  }
+
+  /* Read gemini_api_key:: from [[Auto-Attribute Settings]] page in the graph.
+   * This is the primary key-input mechanism since Roam Desktop (Electron)
+   * blocks window.prompt(). User pastes key into the block; script picks it
+   * up here. Called on init + every scan cycle. */
+  function loadGeminiKeyFromGraph() {
+    try {
+      const pageName = state.settings.settingsPage;
+      const safeName = pageName.replaceAll('"', '\\"');
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?s
+         :where
+         [?p :node/title "${safeName}"]
+         [?b :block/page ?p]
+         [?b :block/string ?s]
+         [(clojure.string/starts-with? ?s "gemini_api_key::")]]
+      `);
+      const raw = rows?.[0]?.[0];
+      if (!raw) return false;
+      const key = raw.replace(/^gemini_api_key::\s*/, "").trim();
+      if (!key || key === "PASTE_YOUR_KEY_HERE") return false;
+      if (key === state.settings.geminiApiKey) return false; // unchanged
+      state.settings.geminiApiKey = key;
+      persistSettings();
+      log("info", `Gemini key loaded from [[${pageName}]] (${key.slice(0,6)}...${key.slice(-4)})`);
+      if (state.settings.useEmbeddings) {
+        state.embedsBootstrapped = false;
+        bootstrapEmbeddings().catch(e => log("warn", "post-load bootstrap failed", e?.message || e));
+      }
+      return true;
+    } catch (e) {
+      log("debug", "loadGeminiKeyFromGraph failed", e);
+      return false;
+    }
+  }
+
+  async function openGeminiKeySettingsPage() {
+    const pageName = state.settings.settingsPage;
+    const safeName = pageName.replaceAll('"', '\\"');
+    // Find or create the page
+    let pageUid;
+    try {
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?u
+         :where
+         [?p :node/title "${safeName}"]
+         [?p :block/uid ?u]]
+      `);
+      pageUid = rows?.[0]?.[0];
+    } catch {}
+    if (!pageUid) {
+      pageUid = window.roamAlphaAPI.util.generateUID();
+      await window.roamAlphaAPI.data.page.create({
+        page: { title: pageName, uid: pageUid },
+      });
+    }
+    // Find or create the gemini_api_key:: block
+    let keyBlockUid;
+    try {
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?u
+         :where
+         [?p :node/title "${safeName}"]
+         [?b :block/page ?p]
+         [?b :block/uid ?u]
+         [?b :block/string ?s]
+         [(clojure.string/starts-with? ?s "gemini_api_key::")]]
+      `);
+      keyBlockUid = rows?.[0]?.[0];
+    } catch {}
+    if (!keyBlockUid) {
+      keyBlockUid = window.roamAlphaAPI.util.generateUID();
+      await window.roamAlphaAPI.data.block.create({
+        location: { "parent-uid": pageUid, order: 0 },
+        block: { uid: keyBlockUid, string: "gemini_api_key:: PASTE_YOUR_KEY_HERE" },
+      });
+      // Add an instructions block too (idempotent — check first)
+      const helpUid = window.roamAlphaAPI.util.generateUID();
+      await window.roamAlphaAPI.data.block.create({
+        location: { "parent-uid": pageUid, order: 1 },
+        block: {
+          uid: helpUid,
+          string: "Get a free Gemini API key at https://aistudio.google.com/apikey — free tier covers 1500 RPD which is ample for this use. Paste your key INTO the gemini_api_key:: block above (replace `PASTE_YOUR_KEY_HERE`). The script picks it up within 15 minutes (or instantly if you re-run a cmd palette command). Then run \"Auto-Attribute: toggle embeddings (Phase 3)\" to bootstrap.",
+        },
+      });
+    }
+    // Open the page (or block) in right sidebar so user can edit immediately
+    try {
+      await window.roamAlphaAPI.ui.rightSidebar.addWindow({
+        window: { type: "block", "block-uid": keyBlockUid },
+      });
+    } catch (e) {
+      log("debug", "rightSidebar open failed (try main window)", e);
+      try {
+        await window.roamAlphaAPI.ui.mainWindow.openPage({ page: { uid: pageUid } });
+      } catch (e2) {
+        log("warn", "openPage also failed", e2);
+      }
+    }
+    return { pageUid, keyBlockUid };
   }
 
   function resetCallsIfNewDay() {
@@ -1530,6 +1639,8 @@ ${entityListLines}${correctionsBlock}`;
       if (state.settings.syncHubOnScan) {
         syncActiveProjectsHub().catch(e => log("warn", "hub sync failed", e));
       }
+      // Phase 3: pick up any new key the user pasted into the settings page
+      loadGeminiKeyFromGraph();
       // Phase 3: refresh stale embeddings + GC removed projects every cycle
       refreshEmbeddingsIfStale().catch(e => log("warn", "embed refresh failed", e?.message || e));
       const uids = findAllTodos();
@@ -1691,25 +1802,24 @@ ${entityListLines}${correctionsBlock}`;
         alert("Bulk convert failed: " + e.message);
       }
     });
-    add("Auto-Attribute: set Gemini API key (Phase 3 embeddings)", () => {
-      const cur = state.settings.geminiApiKey;
-      const masked = cur ? `${cur.slice(0,6)}...${cur.slice(-4)}` : "(none)";
-      const next = prompt(`Paste your Gemini API key.\n\nGet a free key at https://aistudio.google.com/apikey — free tier covers 1500 RPD which is ample for this use.\n\nCurrent: ${masked}\n\nLeave blank + click OK to clear.`, "");
-      if (next === null) return;
-      state.settings.geminiApiKey = next.trim();
-      persistSettings();
-      if (state.settings.geminiApiKey) {
-        log("info", `Gemini key set (${state.settings.geminiApiKey.slice(0,6)}...${state.settings.geminiApiKey.slice(-4)})`);
-        if (state.settings.useEmbeddings) {
-          state.embedsBootstrapped = false;
-          bootstrapEmbeddings().catch(e => log("warn", "post-set bootstrap failed", e?.message || e));
-        } else {
-          alert("Key saved. Now enable embeddings via 'Auto-Attribute: toggle embeddings (Phase 3)'.");
-        }
+    add("Auto-Attribute: set Gemini API key (Phase 3 embeddings)", async () => {
+      // Roam Desktop (Electron) blocks window.prompt(), so we use a graph
+      // page instead — opens [[Auto-Attribute Settings]] in the right sidebar
+      // with a `gemini_api_key:: PASTE_YOUR_KEY_HERE` block. User pastes,
+      // script picks it up automatically.
+      try {
+        const { keyBlockUid } = await openGeminiKeySettingsPage();
+        log("info", `Settings page opened — edit block ${keyBlockUid} in the right sidebar`);
+      } catch (e) {
+        log("error", "openGeminiKeySettingsPage failed", e);
+      }
+    });
+    add("Auto-Attribute: reload Gemini key from graph (after editing settings page)", () => {
+      const ok = loadGeminiKeyFromGraph();
+      if (ok) {
+        log("info", "Gemini key reloaded from graph");
       } else {
-        log("info", "Gemini key cleared — embeddings disabled");
-        state.settings.useEmbeddings = false;
-        persistSettings();
+        log("info", "no key change detected. Edit gemini_api_key:: block on [[Auto-Attribute Settings]] then re-run.");
       }
     });
     add("Auto-Attribute: toggle embeddings (Phase 3)", () => {
@@ -1848,6 +1958,7 @@ ${entityListLines}${correctionsBlock}`;
     }
     state.processedToday = loadProcessed();
     loadPersistentSettings();  // Phase 3: rehydrate geminiApiKey + useEmbeddings
+    loadGeminiKeyFromGraph();  // Phase 3: also check the [[Auto-Attribute Settings]] page (overrides localStorage if newer)
     registerCommands();
     startPullWatch();
     startScan();
