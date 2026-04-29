@@ -81,6 +81,12 @@ Re-pasting the script auto-cleans the previous version's timers and watches via 
 | `suppress_ms:: 2000` | 2000 | Ignore watch callbacks for this long after our own writes (loop prevention). |
 | `dry_run:: false` | false | Log every move that WOULD be executed, without actually moving blocks. |
 | `verbose:: false` | false | Verbose console logging. Off by default. |
+| `conflict_detection:: true` | true | Scan for overlapping time ranges after each reconcile (Phase 2). |
+| `conflict_status_block:: true` | true | Write a status block on the daily page when overlaps exist. Auto-deleted at zero conflicts. |
+| `auto_resolve_conflicts:: false` | false | Auto-bump conflicting items forward (Phase 3). OFF by default. |
+| `conflict_strategy:: bump_forward` | `bump_forward` | Resolution strategy. Only `bump_forward` supported in v1.1.0. |
+| `cascade_cutoff_time:: 23:00` | `23:00` | Refuse to bump past this HH:MM. Beyond cutoff = dead-end (logged + reported). |
+| `pinned_marker:: #pinned-time` | `#pinned-time` | Items whose string contains this tag are NEVER auto-bumped. |
 
 Cmd palette → **"TimeBlock Organizer: open settings page (edit toggles inline)"** to open in the right sidebar.
 
@@ -97,21 +103,55 @@ Cmd palette → **"TimeBlock Organizer: open settings page (edit toggles inline)
 - **toggle enabled (master switch)** — on/off
 - **toggle dry-run mode** — preview without writing
 - **toggle verbose logging** — on/off
+- **toggle conflict detection (Phase 2)** — Phase 2 on/off
+- **toggle conflict status block on daily page** — write to page or console-only
+- **toggle auto-resolve conflicts (Phase 3, opt-in)** — Phase 3 on/off
 
 ### Operations
 - **reconcile current page now** — forces an immediate reconcile of the open daily page (skip debounce)
 - **reconcile today + tomorrow** — runs reconciles on both, useful after pasting a fresh script
+- **show conflicts on current page** — alert + console listing every overlap and dead-end on the open daily page
 - **list active watches (debug)** — table of watched page UIDs with timestamps
 
 ---
 
-## What it doesn't do (yet)
+## Phase 2 — conflict detection (v1.1.0+, on by default)
 
-**Phase 2** (deferred): conflict detection. When two TODOs overlap (e.g. 14:00-15:00 and 14:30-15:30), the plugin currently just sorts them by start-time. A future version will write a `**TimeBlock Conflicts**` status block under the daily page listing each overlapping pair.
+After each reconcile, the plugin scans the sorted TimeBlock children for overlapping time ranges. If any exist, a status block lands on the daily page:
 
-**Phase 3** (deferred, opt-in): smart re-shuffle. When a conflict is detected, automatically bump the later item's start to the earlier item's end, cascading forward up to a configurable cutoff time. Disabled by default — the user might WANT overlapping items.
+```
+**TimeBlock Conflicts** (2) #timeblock-status
+  - 09:00-10:00 "EMP review" overlaps 09:30-10:30 "swab walk" — 30min
+  - 14:00-15:00 "R analysis" overlaps 14:00-14:30 "quick call" — 30min
+```
 
-See `~/roam-js-extensions/SETTINGS-PAGE-ROLLOUT.md` for context on the suite-wide patterns this plugin follows.
+The block is auto-deleted when zero conflicts remain. Console warnings always fire regardless of the status-block setting.
+
+Toggle via:
+- `conflict_detection:: false` to silence warnings entirely
+- `conflict_status_block:: false` to keep console warnings but skip writing to the page
+
+## Phase 3 — auto-resolve (v1.1.0+, opt-in)
+
+When `auto_resolve_conflicts:: true`, the plugin rewrites the later item's time prefix to start at the earlier item's end, cascading forward through chained conflicts:
+
+```
+Before:
+  09:00 - 10:00 EMP review
+  09:30 - 10:30 swab walk    ← bumped
+  10:15 - 11:15 R analysis   ← cascade-bumped
+
+After (cutoff 23:00):
+  09:00 - 10:00 EMP review
+  10:00 - 11:00 swab walk
+  11:00 - 12:00 R analysis
+```
+
+If the cascade would push an item to start past `cascade_cutoff_time` (default 23:00), the item is skipped and reported as a dead-end in the status block instead of being mutated.
+
+**Pinned items**: any TODO whose string contains `pinned_marker` (default `#pinned-time`) is skipped — its time is treated as user-fixed. Cascades around it without touching it. If a pinned item IS the cause of a downstream cascade dead-end, the dead-end gets reported.
+
+**Default off** because you might intentionally want overlaps (e.g. parallel sessions, soft buffers). Turn on via `auto_resolve_conflicts:: true` on the settings page or cmd palette → "toggle auto-resolve conflicts".
 
 ---
 
@@ -129,4 +169,5 @@ See `~/roam-js-extensions/SETTINGS-PAGE-ROLLOUT.md` for context on the suite-wid
 
 ## Version history
 
+- **v1.1.0** — Phase 2 (conflict detection + status block) + Phase 3 (opt-in auto-resolve via `bump_forward` cascade with cutoff + pinned-item skip). Three new toggles, four new cmd palette commands. Status block self-deletes at zero conflicts.
 - **v1.0.0** — Phase 1 ship: pull-watches + reconcile + settings page + idempotent commands + auto-cleanup on init. Fixes COS scheduling bug and handles any other writer.

@@ -1,40 +1,37 @@
-/* timeblock-organizer v1.0.0
+/* timeblock-organizer v1.1.0
  *
- * Watches daily pages and reorganizes time-prefixed TODOs into the
- * #TimeBlock {{[[roam/render]]:((roam-render-Nautilus-cljs))}} parent
- * block, sorted by start-time ascending. Pins the SmartBlock timestamp
- * button block (`{{🕗↦:SmartBlock:Double timestamp buttons2}}`) as the
- * last child. Fixes any scheduling tool — Chief of Staff, manual edits,
- * Better Tasks dropdowns, future skills — without coupling to any
- * specific writer.
+ * v1.1.0 — Phase 2 + Phase 3 ship.
+ *   Phase 2 (conflict detection): after each reconcile, scan the sorted
+ *   TimeBlock children for overlapping time ranges. If conflicts exist,
+ *   write a `**TimeBlock Conflicts** (N) #timeblock-status` block as the
+ *   LAST child of the daily page with one bullet per overlapping pair
+ *   (e.g. `09:00-10:00 "EMP review" overlaps 09:30-10:30 "swab walk" —
+ *   30min`). Block is auto-deleted when zero conflicts remain. Always-on
+ *   console warning regardless of status-block setting.
+ *   Phase 3 (auto-resolve, opt-in): when `auto_resolve_conflicts` is on
+ *   and `conflict_strategy` is `bump_forward`, the script rewrites the
+ *   later item's time prefix to start at the earlier item's end, cascading
+ *   forward. Refuses (and reports as a dead-end in the status block) if
+ *   the cascade pushes past `cascade_cutoff_time` (default 23:00). Items
+ *   tagged with `#pinned-time` are skipped (you decided their time
+ *   intentionally; we won't move them).
+ *
+ * v1.0.0 — Phase 1: watches daily pages and reorganizes time-prefixed
+ *   TODOs into the #TimeBlock parent, sorted by start-time. Pins the
+ *   SmartBlock timestamp button as last child. Pull-watches today +
+ *   tomorrow + historically-visited daily pages within a window. LRU-
+ *   capped, debounced, idempotent.
  *
  * Bug it solves: when COS (or any tool) writes a `14:00 - 15:00 {{[[TODO]]}}
  * foo` block to today's daily page as a direct page-level child, this
  * plugin's pull-watch fires, the block gets moved under TimeBlock at the
  * right time-sorted position, the SmartBlock button stays pinned at the
- * end, and the daily page stays clean.
+ * end, and (v1.1.0) any time conflicts get reported / auto-resolved.
  *
- * No LLM call. Pure Roam datalog + block.move. Cost: $0.
- *
- * Phase 1 scope (this version):
- *   - Pull-watch on today + tomorrow daily pages
- *   - Lazy-watch when user navigates to historical daily pages within
- *     the configured window (default 7 days back)
- *   - LRU-capped active watches (default 14)
- *   - Date rollover detection (60s setInterval registers new today)
- *   - Periodic 5-min reconcile sweep covers `block.update` events that
- *     pull-watch on `:block/children` doesn't fire for
- *   - Idempotent reconcile (no-op when already organized)
- *   - Suppress self-triggered watch fires for 2s after our own moves
- *
- * Phase 2 (future): conflict detection — flag overlapping time ranges
- *   into a status block on the daily page. See SETTINGS-PAGE-ROLLOUT.md.
- *
- * Phase 3 (future): smart re-shuffle — bump conflicting items forward
- *   by overlap, cascade up to a cutoff time. Opt-in.
+ * No LLM call. Pure Roam datalog + block.move/update. Cost: $0.
  */
 ;(function () {
-  const VERSION = "1.0.0";
+  const VERSION = "1.1.0";
   const NAMESPACE = "timeblock-organizer";
   const SETTINGS_PAGE = "TimeBlock Organizer Settings";
 
@@ -50,6 +47,14 @@
     suppressMs: 2000,                      // ignore watch fires from our own writes
     dryRun: false,                         // log moves without executing
     verbose: false,
+    // v1.1.0 Phase 2: conflict detection
+    conflictDetection: true,               // scan for overlapping ranges after each reconcile
+    conflictStatusBlock: true,             // write a status block on the daily page
+    // v1.1.0 Phase 3: auto-resolve (opt-in)
+    autoResolveConflicts: false,           // off by default — you might WANT overlaps
+    conflictStrategy: "bump_forward",      // only one strategy supported for now
+    cascadeCutoffTime: "23:00",            // refuse to bump past this (HH:MM)
+    pinnedMarker: "#pinned-time",          // items with this tag don't get bumped
   };
 
   const state = {
@@ -93,6 +98,20 @@
       "Log every move that WOULD be executed, without actually moving blocks. Useful for previewing behavior."],
     ["verbose",                     "verbose",                   "bool",   false,
       "Verbose console logging. Off by default — most operations are silent."],
+    // Phase 2: conflict detection
+    ["conflict_detection",          "conflictDetection",         "bool",   true,
+      "After each reconcile, scan TimeBlock children for overlapping time ranges. Off = no conflict warnings at all."],
+    ["conflict_status_block",       "conflictStatusBlock",       "bool",   true,
+      "Write a `**TimeBlock Conflicts** (N) #timeblock-status` block on the daily page when overlaps exist. Auto-deleted when zero conflicts. Off = console-only warnings."],
+    // Phase 3: auto-resolve
+    ["auto_resolve_conflicts",      "autoResolveConflicts",      "bool",   false,
+      "Auto-rewrite conflicting time prefixes (bump the later item forward by the overlap). OFF by default — you might intentionally want overlaps. Only takes effect when conflict_detection is also on."],
+    ["conflict_strategy",           "conflictStrategy",          "string", "bump_forward",
+      "Resolution strategy. Only `bump_forward` supported in v1.1.0 — push the later item's start to the earlier item's end, cascading forward."],
+    ["cascade_cutoff_time",         "cascadeCutoffTime",         "string", "23:00",
+      "If a cascade would push an item to start past this time (HH:MM, 24h), refuse the resolution and flag the item as a dead-end in the status block. Default 23:00 (no scheduling past 11pm)."],
+    ["pinned_marker",               "pinnedMarker",              "string", "#pinned-time",
+      "Substring/tag that marks an item as user-pinned. Pinned items are NEVER auto-bumped, even if they're the cause of a cascade dead-end. Add this tag to a TODO to lock its time."],
   ];
 
   // === SETTINGS-PAGE LIB START v1.0.0 === (synced from _lib/settings-page.js)
@@ -357,6 +376,218 @@
     return s === state.settings.smartblockButtonSignature;
   }
 
+  function isPinned(s) {
+    const marker = state.settings.pinnedMarker;
+    return marker && s.includes(marker);
+  }
+
+  function formatMinAsHHMM(minutes) {
+    if (!Number.isFinite(minutes) || minutes < 0) return "00:00";
+    const h = Math.floor(minutes / 60) % 24;
+    const m = minutes % 60;
+    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+  }
+
+  function parseCutoffTime(hhmm) {
+    if (!hhmm || typeof hhmm !== "string") return 23 * 60;
+    const m = hhmm.trim().match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return 23 * 60;
+    const h = parseInt(m[1], 10), mm = parseInt(m[2], 10);
+    if (h > 23 || mm > 59) return 23 * 60;
+    return h * 60 + mm;
+  }
+
+  /* Replace the leading "HH:MM - HH:MM" in a TODO/DONE block with new times. */
+  function rewriteTimePrefix(blockString, newStartMin, newEndMin) {
+    const sh = formatMinAsHHMM(newStartMin);
+    const eh = formatMinAsHHMM(newEndMin);
+    return blockString.replace(TIME_PREFIX_RE, (match) => {
+      const markerMatch = match.match(/\{\{\[\[(?:TODO|DONE)\]\]\}\}/);
+      const marker = markerMatch ? markerMatch[0] : "{{[[TODO]]}}";
+      return `${sh} - ${eh} ${marker}`;
+    });
+  }
+
+  /* ---------- Phase 2: conflict detection ---------- */
+  /**
+   * Given items already sorted by startMin asc, return the list of overlapping
+   * pairs. Each pair: { a, b, overlapMinutes }. Skips zero-duration items
+   * (no time to overlap) and malformed ones (end < start).
+   */
+  function detectOverlaps(sortedItems) {
+    const conflicts = [];
+    const parsed = sortedItems
+      .map(it => ({ ...it, t: parseTimePrefix(it.string) }))
+      .filter(it => it.t && it.t.endMin > it.t.startMin);
+    for (let i = 0; i < parsed.length; i++) {
+      const a = parsed[i];
+      for (let j = i + 1; j < parsed.length; j++) {
+        const b = parsed[j];
+        if (b.t.startMin >= a.t.endMin) break; // sorted; no further overlaps with a
+        const overlapStart = Math.max(a.t.startMin, b.t.startMin);
+        const overlapEnd = Math.min(a.t.endMin, b.t.endMin);
+        if (overlapEnd > overlapStart) {
+          conflicts.push({ a, b, overlapMinutes: overlapEnd - overlapStart });
+        }
+      }
+    }
+    return conflicts;
+  }
+
+  function shortDescription(blockString) {
+    // Strip "HH:MM - HH:MM {{[[TODO/DONE]]}} " prefix; truncate.
+    const stripped = blockString.replace(TIME_PREFIX_RE, "").trim();
+    if (stripped.length <= 50) return stripped;
+    return stripped.slice(0, 47) + "…";
+  }
+
+  function timeRangeOf(item) {
+    const t = parseTimePrefix(item.string);
+    if (!t) return "??:??";
+    return `${formatMinAsHHMM(t.startMin)}-${formatMinAsHHMM(t.endMin)}`;
+  }
+
+  /* ---------- Phase 3: bump_forward auto-resolve ---------- */
+  /**
+   * Walk sorted items left-to-right. For each pair where curr.startMin <
+   * prev.endMin AND curr is not pinned, rewrite curr's start to prev.endMin
+   * (preserving duration). If the new end exceeds cutoff, abort and report
+   * the dead-end. Returns { ok, updates, deadEnds }.
+   *
+   * Note: this is destructive on the input array's `t` field (mutates the
+   * working copy). Callers should map item.string updates from `updates`.
+   */
+  function resolveConflicts(items, cutoffMin) {
+    const working = items
+      .map(it => ({
+        uid: it.uid,
+        originalString: it.string,
+        currentString: it.string,
+        t: parseTimePrefix(it.string),
+        pinned: isPinned(it.string),
+      }))
+      .filter(it => it.t);
+    const updates = [];
+    const deadEnds = [];
+
+    for (let i = 1; i < working.length; i++) {
+      const prev = working[i - 1];
+      const curr = working[i];
+      if (curr.t.startMin >= prev.t.endMin) continue; // no overlap
+      if (curr.pinned) {
+        deadEnds.push({
+          item: curr,
+          reason: `pinned (${state.settings.pinnedMarker}) — refusing to bump`,
+        });
+        continue;
+      }
+      const duration = curr.t.endMin - curr.t.startMin;
+      const newStart = prev.t.endMin;
+      const newEnd = newStart + duration;
+      if (newEnd > cutoffMin) {
+        deadEnds.push({
+          item: curr,
+          reason: `cascade past cutoff: would end ${formatMinAsHHMM(newEnd)} > ${formatMinAsHHMM(cutoffMin)}`,
+        });
+        continue;
+      }
+      curr.t = { startMin: newStart, endMin: newEnd };
+      curr.currentString = rewriteTimePrefix(curr.currentString, newStart, newEnd);
+      updates.push({
+        uid: curr.uid,
+        oldString: curr.originalString,
+        newString: curr.currentString,
+        bumpedFrom: parseTimePrefix(curr.originalString),
+        bumpedTo: { startMin: newStart, endMin: newEnd },
+      });
+    }
+    return { updates, deadEnds };
+  }
+
+  /* ---------- status block management (Phase 2) ---------- */
+  const STATUS_BLOCK_PREFIX = "**TimeBlock Conflicts**";
+
+  function findStatusBlockUid(pageUid) {
+    const children = getDirectChildren(pageUid);
+    for (const c of children) {
+      if (c.string.startsWith(STATUS_BLOCK_PREFIX)) return c.uid;
+    }
+    return null;
+  }
+
+  async function deleteStatusBlock(pageUid) {
+    const uid = findStatusBlockUid(pageUid);
+    if (!uid) return false;
+    try {
+      await window.roamAlphaAPI.data.block.delete({ block: { uid } });
+      return true;
+    } catch (e) {
+      log("warn", `delete status block ${uid} failed`, e?.message || e);
+      return false;
+    }
+  }
+
+  async function ensureStatusBlock(pageUid, conflicts, deadEnds) {
+    if (!state.settings.conflictStatusBlock) return;
+    const total = conflicts.length + deadEnds.length;
+    if (total === 0) {
+      await deleteStatusBlock(pageUid);
+      return;
+    }
+    const headerString = `${STATUS_BLOCK_PREFIX} (${total}) #timeblock-status`;
+    let statusUid = findStatusBlockUid(pageUid);
+    if (!statusUid) {
+      statusUid = window.roamAlphaAPI.util.generateUID();
+      try {
+        await window.roamAlphaAPI.data.block.create({
+          location: { "parent-uid": pageUid, order: "last" },
+          block: { uid: statusUid, string: headerString, open: false },
+        });
+      } catch (e) {
+        log("warn", `create status block failed`, e?.message || e);
+        return;
+      }
+    } else {
+      try {
+        await window.roamAlphaAPI.data.block.update({
+          block: { uid: statusUid, string: headerString },
+        });
+      } catch (e) {
+        log("warn", `update status block string failed`, e?.message || e);
+      }
+    }
+    // Wipe existing children and rewrite
+    const existing = getDirectChildren(statusUid);
+    for (const c of existing) {
+      try { await window.roamAlphaAPI.data.block.delete({ block: { uid: c.uid } }); }
+      catch {}
+    }
+    let order = 0;
+    for (const conf of conflicts) {
+      const aDesc = `${timeRangeOf(conf.a)} "${shortDescription(conf.a.string)}"`;
+      const bDesc = `${timeRangeOf(conf.b)} "${shortDescription(conf.b.string)}"`;
+      const line = `${aDesc} overlaps ${bDesc} — ${conf.overlapMinutes}min`;
+      try {
+        await window.roamAlphaAPI.data.block.create({
+          location: { "parent-uid": statusUid, order },
+          block: { string: line },
+        });
+        order++;
+      } catch (e) { log("debug", `conflict line create failed`, e?.message || e); }
+    }
+    for (const de of deadEnds) {
+      const desc = `${timeRangeOf(de.item)} "${shortDescription(de.item.originalString)}"`;
+      const line = `Dead-end: ${desc} — ${de.reason}`;
+      try {
+        await window.roamAlphaAPI.data.block.create({
+          location: { "parent-uid": statusUid, order },
+          block: { string: line },
+        });
+        order++;
+      } catch (e) { log("debug", `dead-end line create failed`, e?.message || e); }
+    }
+  }
+
   /* ---------- the core: reconcile ---------- */
   /**
    * Compute desired order for TimeBlock children:
@@ -416,40 +647,119 @@
     }
     const { desired, pageLevelMisplaced, currentTbChildren } = computeDesiredOrder(pageUid, tbUid);
 
-    if (isAlreadyOrganized(desired, currentTbChildren, pageLevelMisplaced)) {
+    const alreadyOrganized = isAlreadyOrganized(desired, currentTbChildren, pageLevelMisplaced);
+
+    if (!alreadyOrganized) {
+      const moveCount = pageLevelMisplaced.length + desired.filter((d, i) =>
+        currentTbChildren[i]?.uid !== d.uid
+      ).length;
+      log("info", `reconciling TimeBlock on ${pageUid} (${reason}): ${pageLevelMisplaced.length} pulled in + reorder, ${moveCount} block.moves`);
+
+      if (state.settings.dryRun) {
+        log("info", `[dry-run] would move into order:`, desired.map(d => ({
+          uid: d.uid,
+          preview: d.string.slice(0, 50),
+        })));
+      } else {
+        state.suppressUntil = Date.now() + state.settings.suppressMs;
+        const api = window.roamAlphaAPI.data.block;
+        let executed = 0, failed = 0;
+        for (const item of desired) {
+          try {
+            await api.move({
+              location: { "parent-uid": tbUid, order: "last" },
+              block: { uid: item.uid },
+            });
+            executed++;
+          } catch (e) {
+            log("warn", `move failed for ${item.uid}`, e?.message || e);
+            failed++;
+          }
+        }
+        if (failed > 0) log("warn", `reconcile complete with ${failed} failures (${executed} ok)`);
+      }
+    } else {
       debug(`page ${pageUid} already organized (${desired.length} children)`);
-      return;
     }
 
-    const moveCount = pageLevelMisplaced.length + desired.filter((d, i) =>
-      currentTbChildren[i]?.uid !== d.uid
-    ).length;
-    log("info", `reconciling TimeBlock on ${pageUid} (${reason}): ${pageLevelMisplaced.length} pulled in + reorder, ${moveCount} block.moves`);
-
-    if (state.settings.dryRun) {
-      log("info", `[dry-run] would move into order:`, desired.map(d => ({
-        uid: d.uid,
-        preview: d.string.slice(0, 50),
-      })));
-      return;
-    }
-
-    state.suppressUntil = Date.now() + state.settings.suppressMs;
-    const api = window.roamAlphaAPI.data.block;
-    let executed = 0, failed = 0;
-    for (const item of desired) {
-      try {
-        await api.move({
-          location: { "parent-uid": tbUid, order: "last" },
-          block: { uid: item.uid },
-        });
-        executed++;
-      } catch (e) {
-        log("warn", `move failed for ${item.uid}`, e?.message || e);
-        failed++;
+    // ── Phase 3: auto-resolve conflicts (opt-in) ───────────────────────
+    let resolvedUpdates = [];
+    if (state.settings.conflictDetection && state.settings.autoResolveConflicts && !state.settings.dryRun) {
+      const finalChildren = getDirectChildren(tbUid);
+      const todos = finalChildren.filter(c => isTimePrefixed(c.string));
+      const cutoff = parseCutoffTime(state.settings.cascadeCutoffTime);
+      const result = resolveConflicts(todos, cutoff);
+      if (result.updates.length > 0) {
+        state.suppressUntil = Date.now() + state.settings.suppressMs;
+        const api = window.roamAlphaAPI.data.block;
+        for (const u of result.updates) {
+          try {
+            await api.update({ block: { uid: u.uid, string: u.newString } });
+            resolvedUpdates.push(u);
+            log("info", `bumped ((${u.uid})): ${formatMinAsHHMM(u.bumpedFrom.startMin)} → ${formatMinAsHHMM(u.bumpedTo.startMin)}`);
+          } catch (e) {
+            log("warn", `bump failed for ${u.uid}`, e?.message || e);
+          }
+        }
+        if (resolvedUpdates.length > 0) {
+          // After mutations, re-sort: time prefixes changed, so order may need refresh
+          const refreshedChildren = getDirectChildren(tbUid);
+          const refreshedTodos = refreshedChildren.filter(c => isTimePrefixed(c.string));
+          const refreshedSorted = [...refreshedTodos].sort((a, b) =>
+            parseTimePrefix(a.string).startMin - parseTimePrefix(b.string).startMin
+          );
+          // Compare against current order; if drift, re-move into sorted sequence
+          let needsResort = false;
+          for (let i = 0; i < refreshedTodos.length; i++) {
+            if (refreshedTodos[i].uid !== refreshedSorted[i].uid) { needsResort = true; break; }
+          }
+          if (needsResort) {
+            const buttons = refreshedChildren.filter(c => isSmartBlockButton(c.string));
+            const others = refreshedChildren.filter(c =>
+              !isTimePrefixed(c.string) && !isSmartBlockButton(c.string)
+            );
+            const finalDesired = [...others, ...refreshedSorted, ...buttons];
+            for (const item of finalDesired) {
+              try { await api.move({ location: { "parent-uid": tbUid, order: "last" }, block: { uid: item.uid } }); }
+              catch (e) { log("warn", `post-bump re-sort move failed for ${item.uid}`, e?.message || e); }
+            }
+          }
+        }
       }
     }
-    if (failed > 0) log("warn", `reconcile complete with ${failed} failures (${executed} ok)`);
+
+    // ── Phase 2: conflict detection + status block ─────────────────────
+    if (state.settings.conflictDetection) {
+      const finalChildren = getDirectChildren(tbUid);
+      const todos = finalChildren.filter(c => isTimePrefixed(c.string));
+      const conflicts = detectOverlaps(todos);
+      // Re-detect dead-ends from any updates we attempted (resolveConflicts
+      // returned them above — they apply even after partial bumps).
+      let deadEnds = [];
+      if (state.settings.autoResolveConflicts) {
+        const cutoff = parseCutoffTime(state.settings.cascadeCutoffTime);
+        const result = resolveConflicts(todos, cutoff); // re-run to detect any remaining
+        deadEnds = result.deadEnds;
+      }
+      if (conflicts.length > 0 || deadEnds.length > 0) {
+        log("warn", `${conflicts.length} conflict(s)${deadEnds.length ? ` + ${deadEnds.length} dead-end(s)` : ""} on page ${pageUid}`);
+        for (const c of conflicts) {
+          log("warn", `  ${timeRangeOf(c.a)} "${shortDescription(c.a.string)}" overlaps ${timeRangeOf(c.b)} "${shortDescription(c.b.string)}" (${c.overlapMinutes}min)`);
+        }
+        for (const de of deadEnds) {
+          log("warn", `  dead-end: ${timeRangeOf(de.item)} "${shortDescription(de.item.originalString)}" — ${de.reason}`);
+        }
+        if (!state.settings.dryRun) {
+          state.suppressUntil = Date.now() + state.settings.suppressMs;
+          await ensureStatusBlock(pageUid, conflicts, deadEnds);
+        }
+      } else {
+        if (!state.settings.dryRun) {
+          state.suppressUntil = Date.now() + state.settings.suppressMs;
+          await deleteStatusBlock(pageUid);
+        }
+      }
+    }
   }
 
   function scheduleReconcile(pageUid, reason) {
@@ -616,6 +926,39 @@
     add("TimeBlock Organizer: toggle enabled (master switch)", toggleSetting("enabled", "enabled", "enabled"));
     add("TimeBlock Organizer: toggle dry-run mode", toggleSetting("dry_run", "dryRun", "dryRun"));
     add("TimeBlock Organizer: toggle verbose logging", toggleSetting("verbose", "verbose", "verbose"));
+    add("TimeBlock Organizer: toggle conflict detection (Phase 2)", toggleSetting("conflict_detection", "conflictDetection", "conflictDetection"));
+    add("TimeBlock Organizer: toggle conflict status block on daily page", toggleSetting("conflict_status_block", "conflictStatusBlock", "conflictStatusBlock"));
+    add("TimeBlock Organizer: toggle auto-resolve conflicts (Phase 3, opt-in)", toggleSetting("auto_resolve_conflicts", "autoResolveConflicts", "autoResolveConflicts"));
+    add("TimeBlock Organizer: show conflicts on current page", async () => {
+      let openUid;
+      try { openUid = window.roamAlphaAPI.ui.mainWindow.getOpenPageOrBlockUid(); }
+      catch {}
+      if (!openUid) return log("warn", "no open page detected");
+      const tbUid = findTimeBlockUid(openUid);
+      if (!tbUid) return log("info", `no TimeBlock parent on ${openUid}`);
+      const finalChildren = getDirectChildren(tbUid);
+      const todos = finalChildren.filter(c => isTimePrefixed(c.string));
+      const conflicts = detectOverlaps(todos);
+      const cutoff = parseCutoffTime(state.settings.cascadeCutoffTime);
+      const { deadEnds } = resolveConflicts(todos, cutoff);
+      if (conflicts.length === 0 && deadEnds.length === 0) {
+        log("info", "no conflicts on this page");
+        try { alert("No conflicts on this page."); } catch {}
+        return;
+      }
+      const lines = [
+        `${conflicts.length} conflict(s), ${deadEnds.length} dead-end(s):`,
+        "",
+        ...conflicts.map(c =>
+          `• ${timeRangeOf(c.a)} "${shortDescription(c.a.string)}" overlaps ${timeRangeOf(c.b)} "${shortDescription(c.b.string)}" — ${c.overlapMinutes}min`
+        ),
+        ...deadEnds.map(de =>
+          `× dead-end: ${timeRangeOf(de.item)} "${shortDescription(de.item.originalString)}" — ${de.reason}`
+        ),
+      ];
+      console.log(lines.join("\n"));
+      try { alert(lines.join("\n")); } catch {}
+    });
     add("TimeBlock Organizer: reconcile current page now", async () => {
       let openUid;
       try { openUid = window.roamAlphaAPI.ui.mainWindow.getOpenPageOrBlockUid(); }
@@ -638,6 +981,9 @@
         `  ${onOff(state.settings.enabled)} enabled (master switch)`,
         `  ${onOff(state.settings.dryRun)} dry-run mode`,
         `  ${onOff(state.settings.verbose)} verbose logging`,
+        `  ${onOff(state.settings.conflictDetection)} conflict detection (Phase 2)`,
+        `  ${onOff(state.settings.conflictStatusBlock)} status block on daily page`,
+        `  ${onOff(state.settings.autoResolveConflicts)} auto-resolve conflicts (Phase 3, opt-in)`,
         ``,
         `── runtime ──`,
         `  Active watches: ${state.activeWatches.size} / ${state.settings.maxActiveWatches}`,
@@ -646,6 +992,7 @@
         `  TimeBlock signature: ${state.settings.timeblockSignature.slice(0, 60)}...`,
         `  SmartBlock button: ${state.settings.smartblockButtonSignature}`,
         `  Debounce: ${state.settings.debounceMs}ms / sweep: ${state.settings.sweepIntervalMs / 60000}min`,
+        `  Conflict strategy: ${state.settings.conflictStrategy} / cutoff: ${state.settings.cascadeCutoffTime} / pinned marker: ${state.settings.pinnedMarker}`,
         ``,
         `Watched pages:`,
         ...Array.from(state.activeWatches.entries()).map(([uid, w]) =>
