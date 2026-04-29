@@ -5,6 +5,15 @@
   "updated": "2026-04-29",
   "scripts": [
     {
+      "name": "timeblock-organizer",
+      "version": "1.0.0",
+      "namespace": "timeblock-organizer",
+      "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/timeblock-organizer/script.js",
+      "description": "Pull-watches daily pages and reorganizes time-prefixed TODOs into the #TimeBlock parent, sorted by start-time, with the SmartBlock timestamp button pinned last. Fixes scheduling bugs in any writer (Chief of Staff, Better Tasks, manual edits).",
+      "auto_runs": true,
+      "settings_page": "TimeBlock Organizer Settings"
+    },
+    {
       "name": "auto-attribute-todo",
       "version": "1.7.5",
       "namespace": "auto-attr-todo",
