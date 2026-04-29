@@ -1,4 +1,17 @@
-/* auto-attribute-todo v1.7.3
+/* auto-attribute-todo v1.7.4
+ *
+ * v1.7.4 — Unified settings page. Every user-controllable setting now lives
+ * on [[Auto-Attribute Settings]] as a `key:: value` block (one block per
+ * setting; the value is editable inline). Graph is the source of truth;
+ * localStorage is a write-through cache for fast init. Toggles flipped via
+ * cmd palette write back to the graph block, so the page always reflects
+ * current state — answers "is auto-create on right now?" with one glance.
+ *   New cmd palette commands: "open settings page (edit toggles inline)"
+ * (opens the page in the right sidebar) and "show stats (current settings)"
+ * (alert + console with a clear ON/OFF panel for every toggle).
+ *   Backward compatible: old localStorage-backed settings still load. Old
+ * gemini_api_key:: block is now part of the broader settings page, no
+ * migration needed.
  *
  * v1.7.3 — THREE fixes from real-world breakage:
  *   (a) **Ghost cmd palette commands**. Roam doesn't unregister cmd palette
@@ -184,7 +197,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.7.3";
+  const VERSION = "1.7.4";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -291,11 +304,60 @@
     }
   }
 
-  /* Read gemini_api_key:: from [[Auto-Attribute Settings]] page in the graph.
-   * This is the primary key-input mechanism since Roam Desktop (Electron)
-   * blocks window.prompt(). User pastes key into the block; script picks it
-   * up here. Called on init + every scan cycle. */
-  function loadGeminiKeyFromGraph() {
+  /* v1.7.4: full settings page schema. Every user-controllable setting lives
+   * as a `graphKey:: value` block on [[Auto-Attribute Settings]]. The graph
+   * is the source of truth (localStorage is a cache for fast init).
+   *
+   * Format per row: [graphKey, settingsKey, type, default, description].
+   * Bool keys parse "true/yes/on/1" → true, anything else → false.
+   * Numeric keys parse via parseInt/parseFloat. */
+  const GRAPH_SETTINGS = [
+    // Core toggles — flip ON/OFF inline
+    ["enabled",                "enabled",                "bool",   true,  "Master switch. false = the script ignores all TODOs."],
+    ["auto_create_projects",   "autoCreateProjects",     "bool",   true,  "When AI suggests a new project that doesn't exist, auto-create the page (Project Status:: Active)."],
+    ["clean_todo_text",        "cleanTodoText",          "bool",   true,  "Rewrite the TODO title to remove hints captured into BT_attr children (e.g. 'tomorrow' → captured in BT_attrDue)."],
+    ["use_dropdown",           "useDropdown",            "bool",   true,  "Emit BT_attrProject as {{or:}} dropdown so you can override the AI pick with one click."],
+    ["use_embeddings",         "useEmbeddings",          "bool",   false, "Phase 3 semantic ranker. Requires gemini_api_key. Falls back silently to graph-Jaccard if disabled or fails."],
+    ["require_confirmation",   "requireConfirmation",    "bool",   false, "Suggestion-only mode. Logs the AI's pick but doesn't write BT_attr children. Useful for evaluating accuracy."],
+    ["sync_hub_on_scan",       "syncHubOnScan",          "bool",   true,  "Refresh [[Active Projects]] hub on each 15-min scan cycle. Off = manual only via cmd palette."],
+    // Phase 3 secret + tunables
+    ["gemini_api_key",         "geminiApiKey",           "string", "",    "Free key at https://aistudio.google.com/apikey — covers 1500 RPD."],
+    ["embedding_top_k",        "embeddingTopK",          "int",    5,     "How many top-similarity projects to send to the LLM as candidates. 3-10 reasonable; 5 is the sweet spot."],
+    ["embedding_graph_weight", "embeddingGraphWeight",   "float",  0.2,   "Tie-breaker weight for graph-Jaccard score (0 = pure semantic, 1 = pure graph). 0.2 default."],
+    // LLM tunables
+    ["confidence_threshold",   "confidenceThreshold",    "float",  0.6,   "Below this, BT_attrNotes gets a '(low conf — verify)' suffix prompting you to double-check."],
+    ["daily_call_cap",         "dailyCallCap",           "int",    100,   "Max LLM attribution calls per day. Resets at midnight local."],
+    ["debounce_ms",            "debounceMs",             "int",    5000,  "ms to wait after a TODO is created/edited before processing. Lets you keep typing."],
+    ["auto_create_min_conf",   "autoCreateMinConfidence", "float", 0.7,   "AI must be at least this confident before auto-creating a new project page."],
+    ["auto_create_daily_cap",  "autoCreateDailyCap",     "int",    5,     "Max new project pages auto-created per day. Resets at midnight."],
+  ];
+
+  function parseSettingValue(type, raw) {
+    if (raw == null) return null;
+    const s = String(raw).trim();
+    if (type === "bool") {
+      const lower = s.toLowerCase();
+      return lower === "true" || lower === "yes" || lower === "on" || lower === "1" || lower === "y";
+    }
+    if (type === "int") {
+      const n = parseInt(s, 10);
+      return Number.isFinite(n) ? n : null;
+    }
+    if (type === "float") {
+      const n = parseFloat(s);
+      return Number.isFinite(n) ? n : null;
+    }
+    return s; // "string"
+  }
+
+  function formatSettingValue(type, value) {
+    if (type === "bool") return value ? "true" : "false";
+    return String(value);
+  }
+
+  /* Read every recognized `graphKey:: value` block on the settings page.
+   * Returns count of settings updated. Called on init + every scan cycle. */
+  function loadAllSettingsFromGraph() {
     try {
       const pageName = state.settings.settingsPage;
       const safeName = pageName.replaceAll('"', '\\"');
@@ -304,32 +366,107 @@
          :where
          [?p :node/title "${safeName}"]
          [?b :block/page ?p]
-         [?b :block/string ?s]
-         [(clojure.string/starts-with? ?s "gemini_api_key::")]]
+         [?b :block/string ?s]]
       `);
-      const raw = rows?.[0]?.[0];
-      if (!raw) return false;
-      const key = raw.replace(/^gemini_api_key::\s*/, "").trim();
-      if (!key || key === "PASTE_YOUR_KEY_HERE") return false;
-      if (key === state.settings.geminiApiKey) return false; // unchanged
-      state.settings.geminiApiKey = key;
-      persistSettings();
-      log("info", `Gemini key loaded from [[${pageName}]] (${key.slice(0,6)}...${key.slice(-4)})`);
-      if (state.settings.useEmbeddings) {
-        state.embedsBootstrapped = false;
-        bootstrapEmbeddings().catch(e => log("warn", "post-load bootstrap failed", e?.message || e));
+      const blocksByKey = {};
+      for (const r of rows) {
+        const s = (r[0] || "").trim();
+        const m = s.match(/^([a-z_][a-z0-9_]*)::\s*(.*)$/i);
+        if (m) blocksByKey[m[1]] = m[2];
       }
-      return true;
+      let updated = 0;
+      for (const [graphKey, settingsKey, type] of GRAPH_SETTINGS) {
+        if (!(graphKey in blocksByKey)) continue;
+        const raw = blocksByKey[graphKey];
+        if (graphKey === "gemini_api_key" && (raw === "" || raw === "PASTE_YOUR_KEY_HERE")) continue;
+        const parsed = parseSettingValue(type, raw);
+        if (parsed === null) continue;
+        if (state.settings[settingsKey] === parsed) continue;
+        state.settings[settingsKey] = parsed;
+        updated++;
+      }
+      if (updated > 0) {
+        persistSettings();
+        log("info", `loaded ${updated} setting(s) from [[${pageName}]]`);
+        // Bootstrap embeddings if just turned on
+        if (state.settings.useEmbeddings && state.settings.geminiApiKey && !state.embedsBootstrapped) {
+          bootstrapEmbeddings().catch(e => log("warn", "post-load bootstrap failed", e?.message || e));
+        }
+      }
+      return updated;
     } catch (e) {
-      log("debug", "loadGeminiKeyFromGraph failed", e);
-      return false;
+      log("debug", "loadAllSettingsFromGraph failed", e);
+      return 0;
     }
   }
 
-  async function openGeminiKeySettingsPage() {
+  /* Backward-compat shim — callers still invoke loadGeminiKeyFromGraph */
+  function loadGeminiKeyFromGraph() {
+    return loadAllSettingsFromGraph() > 0;
+  }
+
+  /* Find a setting block on the settings page; create if missing. */
+  async function ensureSettingsBlock(pageUid, graphKey, type, currentValue, description, order) {
+    const safeName = state.settings.settingsPage.replaceAll('"', '\\"');
+    const rows = window.roamAlphaAPI.data.q(`
+      [:find ?u
+       :where
+       [?p :node/title "${safeName}"]
+       [?b :block/page ?p]
+       [?b :block/uid ?u]
+       [?b :block/string ?s]
+       [(clojure.string/starts-with? ?s "${graphKey}::")]]
+    `);
+    let blockUid = rows?.[0]?.[0];
+    if (blockUid) return blockUid;
+    blockUid = window.roamAlphaAPI.util.generateUID();
+    const placeholder = (graphKey === "gemini_api_key" && !currentValue) ? "PASTE_YOUR_KEY_HERE" : formatSettingValue(type, currentValue);
+    await window.roamAlphaAPI.data.block.create({
+      location: { "parent-uid": pageUid, order },
+      block: { uid: blockUid, string: `${graphKey}:: ${placeholder}` },
+    });
+    // Add description as a child block
+    const descUid = window.roamAlphaAPI.util.generateUID();
+    await window.roamAlphaAPI.data.block.create({
+      location: { "parent-uid": blockUid, order: 0 },
+      block: { uid: descUid, string: description },
+    });
+    return blockUid;
+  }
+
+  /* Write a single setting back to its graph block (called when toggle cmd
+   * flips the value, so the page stays in sync with cmd palette state). */
+  async function persistSettingToGraph(graphKey) {
+    const row = GRAPH_SETTINGS.find(r => r[0] === graphKey);
+    if (!row) return;
+    const [, settingsKey, type] = row;
+    const value = state.settings[settingsKey];
+    const safeName = state.settings.settingsPage.replaceAll('"', '\\"');
+    try {
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?u
+         :where
+         [?p :node/title "${safeName}"]
+         [?b :block/page ?p]
+         [?b :block/uid ?u]
+         [?b :block/string ?s]
+         [(clojure.string/starts-with? ?s "${graphKey}::")]]
+      `);
+      const blockUid = rows?.[0]?.[0];
+      if (!blockUid) return; // page not bootstrapped yet, fine
+      await window.roamAlphaAPI.data.block.update({
+        block: { uid: blockUid, string: `${graphKey}:: ${formatSettingValue(type, value)}` },
+      });
+    } catch (e) {
+      log("debug", `persistSettingToGraph(${graphKey}) failed`, e?.message || e);
+    }
+  }
+
+  /* Idempotent: ensure the settings page exists with all GRAPH_SETTINGS
+   * blocks. Pre-existing blocks aren't touched. */
+  async function ensureSettingsPage(openInSidebar = true) {
     const pageName = state.settings.settingsPage;
     const safeName = pageName.replaceAll('"', '\\"');
-    // Find or create the page
     let pageUid;
     try {
       const rows = window.roamAlphaAPI.data.q(`
@@ -346,50 +483,58 @@
         page: { title: pageName, uid: pageUid },
       });
     }
-    // Find or create the gemini_api_key:: block
-    let keyBlockUid;
-    try {
-      const rows = window.roamAlphaAPI.data.q(`
+    // Header help block (only if missing)
+    const headerRows = window.roamAlphaAPI.data.q(`
+      [:find ?u
+       :where
+       [?p :node/title "${safeName}"]
+       [?b :block/page ?p]
+       [?b :block/uid ?u]
+       [?b :block/string ?s]
+       [(clojure.string/starts-with? ?s "**How to use this page**")]]
+    `);
+    if (!headerRows?.[0]?.[0]) {
+      const headerUid = window.roamAlphaAPI.util.generateUID();
+      await window.roamAlphaAPI.data.block.create({
+        location: { "parent-uid": pageUid, order: 0 },
+        block: { uid: headerUid, string: "**How to use this page** — every setting below is `key:: value`. Edit the value inline (click the block, change the text, click out). The script reloads from this page every 15 min, or instantly via cmd palette → \"Auto-Attribute: reload settings from graph\". Bool keys: `true` or `false`. Numbers as plain digits. Description of each setting is the child block." },
+      });
+    }
+    // Bootstrap each setting block in order
+    let order = 1;
+    let firstNewBlock = null;
+    for (const [graphKey, settingsKey, type, , description] of GRAPH_SETTINGS) {
+      const before = window.roamAlphaAPI.data.q(`
         [:find ?u
          :where
          [?p :node/title "${safeName}"]
          [?b :block/page ?p]
          [?b :block/uid ?u]
          [?b :block/string ?s]
-         [(clojure.string/starts-with? ?s "gemini_api_key::")]]
-      `);
-      keyBlockUid = rows?.[0]?.[0];
-    } catch {}
-    if (!keyBlockUid) {
-      keyBlockUid = window.roamAlphaAPI.util.generateUID();
-      await window.roamAlphaAPI.data.block.create({
-        location: { "parent-uid": pageUid, order: 0 },
-        block: { uid: keyBlockUid, string: "gemini_api_key:: PASTE_YOUR_KEY_HERE" },
-      });
-      // Add an instructions block too (idempotent — check first)
-      const helpUid = window.roamAlphaAPI.util.generateUID();
-      await window.roamAlphaAPI.data.block.create({
-        location: { "parent-uid": pageUid, order: 1 },
-        block: {
-          uid: helpUid,
-          string: "Get a free Gemini API key at https://aistudio.google.com/apikey — free tier covers 1500 RPD which is ample for this use. Paste your key INTO the gemini_api_key:: block above (replace `PASTE_YOUR_KEY_HERE`). The script picks it up within 15 minutes (or instantly if you re-run a cmd palette command). Then run \"Auto-Attribute: toggle embeddings (Phase 3)\" to bootstrap.",
-        },
-      });
+         [(clojure.string/starts-with? ?s "${graphKey}::")]]
+      `)?.[0]?.[0];
+      const blockUid = await ensureSettingsBlock(
+        pageUid, graphKey, type, state.settings[settingsKey], description, order
+      );
+      if (!before && !firstNewBlock) firstNewBlock = blockUid;
+      order++;
     }
-    // Open the page (or block) in right sidebar so user can edit immediately
-    try {
-      await window.roamAlphaAPI.ui.rightSidebar.addWindow({
-        window: { type: "block", "block-uid": keyBlockUid },
-      });
-    } catch (e) {
-      log("debug", "rightSidebar open failed (try main window)", e);
+    if (openInSidebar) {
+      const targetUid = firstNewBlock || pageUid;
       try {
-        await window.roamAlphaAPI.ui.mainWindow.openPage({ page: { uid: pageUid } });
-      } catch (e2) {
-        log("warn", "openPage also failed", e2);
+        await window.roamAlphaAPI.ui.rightSidebar.addWindow({
+          window: { type: firstNewBlock ? "block" : "outline", "block-uid": targetUid },
+        });
+      } catch (e) {
+        log("debug", "rightSidebar open failed (try main window)", e);
+        try {
+          await window.roamAlphaAPI.ui.mainWindow.openPage({ page: { uid: pageUid } });
+        } catch (e2) {
+          log("warn", "openPage also failed", e2);
+        }
       }
     }
-    return { pageUid, keyBlockUid };
+    return pageUid;
   }
 
   function resetCallsIfNewDay() {
@@ -1792,8 +1937,8 @@ ${entityListLines}${correctionsBlock}`;
       if (state.settings.syncHubOnScan) {
         syncActiveProjectsHub().catch(e => log("warn", "hub sync failed", e));
       }
-      // Phase 3: pick up any new key the user pasted into the settings page
-      loadGeminiKeyFromGraph();
+      // v1.7.4: pick up any setting the user changed inline on the settings page
+      loadAllSettingsFromGraph();
       // Phase 3: refresh stale embeddings + GC removed projects every cycle
       refreshEmbeddingsIfStale().catch(e => log("warn", "embed refresh failed", e?.message || e));
       const uids = findAllTodos();
@@ -1871,29 +2016,37 @@ ${entityListLines}${correctionsBlock}`;
       state.processedToday.delete(f["block-uid"]); // allow re-process
       await processBlock(f["block-uid"]);
     });
-    add("Auto-Attribute: toggle enabled", () => {
-      state.settings.enabled = !state.settings.enabled;
-      log("info", `enabled: ${state.settings.enabled}`);
-    });
-    add("Auto-Attribute: toggle suggestion-only mode", () => {
-      state.settings.requireConfirmation = !state.settings.requireConfirmation;
-      log("info", `requireConfirmation: ${state.settings.requireConfirmation}`);
-    });
-    add("Auto-Attribute: toggle clean-text (rewrite TODO title)", () => {
-      state.settings.cleanTodoText = !state.settings.cleanTodoText;
-      log("info", `cleanTodoText: ${state.settings.cleanTodoText}`);
-    });
-    add("Auto-Attribute: toggle dropdown mode (BT_attrProject)", () => {
-      state.settings.useDropdown = !state.settings.useDropdown;
-      log("info", `useDropdown: ${state.settings.useDropdown} — ${state.settings.useDropdown ? "new TODOs will get {{or:}} dropdown" : "new TODOs will get flat [[Project]]"}`);
+    // v1.7.4: each toggle persists to BOTH localStorage AND the graph
+    // settings page, so [[Auto-Attribute Settings]] always shows current
+    // state. Toggle from cmd palette OR edit the page block — same result.
+    const toggleSetting = (graphKey, settingsKey, descriptor) => async () => {
+      state.settings[settingsKey] = !state.settings[settingsKey];
+      persistSettings();
+      await persistSettingToGraph(graphKey);
+      const status = state.settings[settingsKey] ? "ON" : "OFF";
+      log("info", `${descriptor}: ${status}`);
+    };
+    add("Auto-Attribute: toggle enabled (master switch)", toggleSetting("enabled", "enabled", "enabled"));
+    add("Auto-Attribute: toggle suggestion-only mode", toggleSetting("require_confirmation", "requireConfirmation", "requireConfirmation"));
+    add("Auto-Attribute: toggle clean-text (rewrite TODO title)", toggleSetting("clean_todo_text", "cleanTodoText", "cleanTodoText"));
+    add("Auto-Attribute: toggle dropdown mode (BT_attrProject)", toggleSetting("use_dropdown", "useDropdown", "useDropdown"));
+    add("Auto-Attribute: toggle auto-create projects", async () => {
+      await toggleSetting("auto_create_projects", "autoCreateProjects", "autoCreateProjects")();
+      if (state.settings.autoCreateProjects) {
+        log("info", `(min conf ${state.settings.autoCreateMinConfidence}, cap ${state.settings.autoCreateDailyCap}/day)`);
+      }
     });
     add("Auto-Attribute: sync [[Active Projects]] hub now", async () => {
       const uid = await syncActiveProjectsHub();
       log("info", `hub sync done — uid=${uid}`);
     });
-    add("Auto-Attribute: toggle auto-create projects", () => {
-      state.settings.autoCreateProjects = !state.settings.autoCreateProjects;
-      log("info", `autoCreateProjects: ${state.settings.autoCreateProjects} ${state.settings.autoCreateProjects ? "(min conf " + state.settings.autoCreateMinConfidence + ", cap " + state.settings.autoCreateDailyCap + "/day)" : ""}`);
+    add("Auto-Attribute: open settings page (edit toggles inline)", async () => {
+      try {
+        const pageUid = await ensureSettingsPage(true);
+        log("info", `Settings page opened — edit any setting block in the right sidebar. Page uid: ${pageUid}`);
+      } catch (e) {
+        log("error", "ensureSettingsPage failed", e);
+      }
     });
     add("Auto-Attribute: show recent corrections (debug)", () => {
       const recent = getRecentCorrections(state.settings.fewShotCorrectionsCount);
@@ -1963,33 +2116,33 @@ ${entityListLines}${correctionsBlock}`;
       }
     });
     add("Auto-Attribute: set Gemini API key (Phase 3 embeddings)", async () => {
-      // Roam Desktop (Electron) blocks window.prompt(), so we use a graph
-      // page instead — opens [[Auto-Attribute Settings]] in the right sidebar
-      // with a `gemini_api_key:: PASTE_YOUR_KEY_HERE` block. User pastes,
-      // script picks it up automatically.
+      // Opens [[Auto-Attribute Settings]] page in the right sidebar with
+      // a gemini_api_key:: PASTE_YOUR_KEY_HERE block (and all other
+      // toggles). User edits the value inline; script picks it up.
       try {
-        const { keyBlockUid } = await openGeminiKeySettingsPage();
-        log("info", `Settings page opened — edit block ${keyBlockUid} in the right sidebar`);
+        await ensureSettingsPage(true);
+        log("info", `Settings page opened — edit gemini_api_key:: block in the right sidebar`);
       } catch (e) {
-        log("error", "openGeminiKeySettingsPage failed", e);
+        log("error", "ensureSettingsPage failed", e);
       }
     });
-    add("Auto-Attribute: reload Gemini key from graph (after editing settings page)", () => {
-      const ok = loadGeminiKeyFromGraph();
-      if (ok) {
-        log("info", "Gemini key reloaded from graph");
+    add("Auto-Attribute: reload settings from graph (after editing settings page)", () => {
+      const updated = loadAllSettingsFromGraph();
+      if (updated > 0) {
+        log("info", `${updated} setting(s) reloaded from graph`);
       } else {
-        log("info", "no key change detected. Edit gemini_api_key:: block on [[Auto-Attribute Settings]] then re-run.");
+        log("info", "no setting changes detected. Edit a `key:: value` block on [[Auto-Attribute Settings]] then re-run.");
       }
     });
-    add("Auto-Attribute: toggle embeddings (Phase 3)", () => {
+    add("Auto-Attribute: toggle embeddings (Phase 3)", async () => {
       if (!state.settings.geminiApiKey && !state.settings.useEmbeddings) {
         alert("Set Gemini API key first via 'Auto-Attribute: set Gemini API key'.");
         return;
       }
       state.settings.useEmbeddings = !state.settings.useEmbeddings;
       persistSettings();
-      log("info", `useEmbeddings: ${state.settings.useEmbeddings}`);
+      await persistSettingToGraph("use_embeddings");
+      log("info", `useEmbeddings: ${state.settings.useEmbeddings ? "ON" : "OFF"}`);
       if (state.settings.useEmbeddings) {
         state.embedsBootstrapped = false;
         bootstrapEmbeddings().catch(e => log("warn", "post-toggle bootstrap failed", e?.message || e));
@@ -2125,19 +2278,33 @@ ${entityListLines}${correctionsBlock}`;
         alert("Discover failed: " + e.message);
       }
     });
-    add("Auto-Attribute: show stats", () => {
-      log("info", "stats", {
-        version: VERSION,
-        enabled: state.settings.enabled,
-        callsToday: state.callsToday,
-        dailyCap: state.settings.dailyCallCap,
-        processedToday: state.processedToday.size,
-        pending: state.pending.size,
-        liveaiAvailable: !!window.LiveAI_API?.isAvailable(),
-        embeddingsEnabled: state.settings.useEmbeddings,
-        geminiKeySet: !!state.settings.geminiApiKey,
-        cachedEmbeddings: state.projectEmbeddings.size,
-      });
+    add("Auto-Attribute: show stats (current settings)", () => {
+      const onOff = (b) => b ? "ON " : "OFF";
+      const lines = [
+        `auto-attribute-todo v${VERSION}`,
+        ``,
+        `── toggles ──`,
+        `  ${onOff(state.settings.enabled)} enabled (master switch)`,
+        `  ${onOff(state.settings.autoCreateProjects)} auto-create projects`,
+        `  ${onOff(state.settings.cleanTodoText)} clean TODO text (rewrite title)`,
+        `  ${onOff(state.settings.useDropdown)} dropdown for BT_attrProject`,
+        `  ${onOff(state.settings.useEmbeddings)} embeddings (Phase 3 semantic ranker)`,
+        `  ${onOff(state.settings.requireConfirmation)} suggestion-only mode`,
+        `  ${onOff(state.settings.syncHubOnScan)} sync [[Active Projects]] hub on scan`,
+        ``,
+        `── runtime ──`,
+        `  LLM calls today: ${state.callsToday} / ${state.settings.dailyCallCap}`,
+        `  Processed today: ${state.processedToday.size}`,
+        `  Pending debounce: ${state.pending.size}`,
+        `  LiveAI available: ${!!window.LiveAI_API?.isAvailable()}`,
+        `  Gemini key set: ${!!state.settings.geminiApiKey}${state.settings.geminiApiKey ? ` (${state.settings.geminiApiKey.slice(0,6)}...${state.settings.geminiApiKey.slice(-4)})` : ""}`,
+        `  Embedding model: ${state.settings.embeddingModel}`,
+        `  Cached embeddings: ${state.projectEmbeddings.size}`,
+        ``,
+        `Edit any setting via cmd palette → "open settings page", or paste new toggles into [[${state.settings.settingsPage}]].`,
+      ];
+      console.log(lines.join("\n"));
+      try { alert(lines.join("\n")); } catch {}
     });
     add("Auto-Attribute: scan now", () => {
       const uids = findAllTodos();
@@ -2201,8 +2368,13 @@ ${entityListLines}${correctionsBlock}`;
       log("info", `LiveAI default model: ${window.LiveAI_API.getDefaultModel()}`);
     }
     state.processedToday = loadProcessed();
-    loadPersistentSettings();  // Phase 3: rehydrate geminiApiKey + useEmbeddings
-    loadGeminiKeyFromGraph();  // Phase 3: also check the [[Auto-Attribute Settings]] page (overrides localStorage if newer)
+    loadPersistentSettings();  // Phase 3: rehydrate from localStorage cache
+    // v1.7.4: bootstrap [[Auto-Attribute Settings]] page (creates missing
+    // setting blocks idempotently) then load values from graph. Graph wins
+    // over localStorage if they disagree — page is source of truth.
+    ensureSettingsPage(false)
+      .then(() => loadAllSettingsFromGraph())
+      .catch(e => log("warn", "settings page bootstrap failed", e?.message || e));
     registerCommands();
     startPullWatch();
     startScan();
