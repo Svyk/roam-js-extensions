@@ -197,7 +197,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.7.4";
+  const VERSION = "1.7.5";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
 
@@ -279,31 +279,6 @@
     }));
   }
 
-  /* ── Phase 3: persistent settings (geminiApiKey, useEmbeddings) ────────── */
-  function loadPersistentSettings() {
-    try {
-      const raw = localStorage.getItem(sk("settings"));
-      if (!raw) return;
-      const stored = JSON.parse(raw);
-      // Only restore the Phase 3 toggles + key — DEFAULTS owns the rest
-      if (typeof stored.geminiApiKey === "string") state.settings.geminiApiKey = stored.geminiApiKey;
-      if (typeof stored.useEmbeddings === "boolean") state.settings.useEmbeddings = stored.useEmbeddings;
-    } catch (e) {
-      log("warn", "loadPersistentSettings failed", e);
-    }
-  }
-
-  function persistSettings() {
-    try {
-      localStorage.setItem(sk("settings"), JSON.stringify({
-        geminiApiKey: state.settings.geminiApiKey,
-        useEmbeddings: state.settings.useEmbeddings,
-      }));
-    } catch (e) {
-      log("warn", "persistSettings failed", e);
-    }
-  }
-
   /* v1.7.4: full settings page schema. Every user-controllable setting lives
    * as a `graphKey:: value` block on [[Auto-Attribute Settings]]. The graph
    * is the source of truth (localStorage is a cache for fast init).
@@ -332,210 +307,198 @@
     ["auto_create_daily_cap",  "autoCreateDailyCap",     "int",    5,     "Max new project pages auto-created per day. Resets at midnight."],
   ];
 
-  function parseSettingValue(type, raw) {
-    if (raw == null) return null;
-    const s = String(raw).trim();
-    if (type === "bool") {
-      const lower = s.toLowerCase();
-      return lower === "true" || lower === "yes" || lower === "on" || lower === "1" || lower === "y";
-    }
-    if (type === "int") {
-      const n = parseInt(s, 10);
-      return Number.isFinite(n) ? n : null;
-    }
-    if (type === "float") {
-      const n = parseFloat(s);
-      return Number.isFinite(n) ? n : null;
-    }
-    return s; // "string"
-  }
-
-  function formatSettingValue(type, value) {
-    if (type === "bool") return value ? "true" : "false";
-    return String(value);
-  }
-
-  /* Read every recognized `graphKey:: value` block on the settings page.
-   * Returns count of settings updated. Called on init + every scan cycle. */
-  function loadAllSettingsFromGraph() {
-    try {
-      const pageName = state.settings.settingsPage;
-      const safeName = pageName.replaceAll('"', '\\"');
-      const rows = window.roamAlphaAPI.data.q(`
-        [:find ?s
-         :where
-         [?p :node/title "${safeName}"]
-         [?b :block/page ?p]
-         [?b :block/string ?s]]
-      `);
-      const blocksByKey = {};
-      for (const r of rows) {
-        const s = (r[0] || "").trim();
-        const m = s.match(/^([a-z_][a-z0-9_]*)::\s*(.*)$/i);
-        if (m) blocksByKey[m[1]] = m[2];
+  // === SETTINGS-PAGE LIB START v1.0.0 === (synced from _lib/settings-page.js)
+  //
+  // Source of truth for the [[<Plugin> Settings]] page pattern. Inlined into
+  // each plugin's script.js between the START/END markers via
+  // `bash sync-settings-lib.sh`. To update the helpers across all plugins:
+  //
+  //   1. Edit this file
+  //   2. Run `bash sync-settings-lib.sh` from the repo root
+  //   3. Commit + push (each plugin's script.js bytes change)
+  //
+  // Usage inside a plugin's IIFE:
+  //
+  //   const settingsMgr = createSettingsManager({
+  //     SETTINGS_PAGE,         // e.g. "Auto-Attribute Settings"
+  //     GRAPH_SETTINGS,        // [[graphKey, settingsKey, type, default, description], ...]
+  //     settingsRef: state.settings,
+  //     log,                   // function(level, msg, data)
+  //     sk: (k) => `${NAMESPACE}:${k}`,
+  //   });
+  //   const {
+  //     loadPersistentSettings, persistSettings,
+  //     loadAllSettingsFromGraph, persistSettingToGraph, ensureSettingsPage,
+  //   } = settingsMgr;
+  //
+  // The factory returns standalone functions that share access to `ctx` via
+  // closure — same behavior as the previous inline duplicated code. Drop-in
+  // replacement; existing call sites keep working.
+  function createSettingsManager(ctx) {
+    const { SETTINGS_PAGE, GRAPH_SETTINGS, settingsRef, log, sk } = ctx;
+  
+    function parseSettingValue(type, raw) {
+      if (raw == null) return null;
+      const s = String(raw).trim();
+      if (type === "bool") {
+        const lower = s.toLowerCase();
+        return lower === "true" || lower === "yes" || lower === "on" || lower === "1" || lower === "y";
       }
-      let updated = 0;
-      for (const [graphKey, settingsKey, type] of GRAPH_SETTINGS) {
-        if (!(graphKey in blocksByKey)) continue;
-        const raw = blocksByKey[graphKey];
-        if (graphKey === "gemini_api_key" && (raw === "" || raw === "PASTE_YOUR_KEY_HERE")) continue;
-        const parsed = parseSettingValue(type, raw);
-        if (parsed === null) continue;
-        if (state.settings[settingsKey] === parsed) continue;
-        state.settings[settingsKey] = parsed;
-        updated++;
-      }
-      if (updated > 0) {
-        persistSettings();
-        log("info", `loaded ${updated} setting(s) from [[${pageName}]]`);
-        // Bootstrap embeddings if just turned on
-        if (state.settings.useEmbeddings && state.settings.geminiApiKey && !state.embedsBootstrapped) {
-          bootstrapEmbeddings().catch(e => log("warn", "post-load bootstrap failed", e?.message || e));
-        }
-      }
-      return updated;
-    } catch (e) {
-      log("debug", "loadAllSettingsFromGraph failed", e);
-      return 0;
+      if (type === "int") { const n = parseInt(s, 10); return Number.isFinite(n) ? n : null; }
+      if (type === "float") { const n = parseFloat(s); return Number.isFinite(n) ? n : null; }
+      return s;
     }
-  }
-
-  /* Backward-compat shim — callers still invoke loadGeminiKeyFromGraph */
-  function loadGeminiKeyFromGraph() {
-    return loadAllSettingsFromGraph() > 0;
-  }
-
-  /* Find a setting block on the settings page; create if missing. */
-  async function ensureSettingsBlock(pageUid, graphKey, type, currentValue, description, order) {
-    const safeName = state.settings.settingsPage.replaceAll('"', '\\"');
-    const rows = window.roamAlphaAPI.data.q(`
-      [:find ?u
-       :where
-       [?p :node/title "${safeName}"]
-       [?b :block/page ?p]
-       [?b :block/uid ?u]
-       [?b :block/string ?s]
-       [(clojure.string/starts-with? ?s "${graphKey}::")]]
-    `);
-    let blockUid = rows?.[0]?.[0];
-    if (blockUid) return blockUid;
-    blockUid = window.roamAlphaAPI.util.generateUID();
-    const placeholder = (graphKey === "gemini_api_key" && !currentValue) ? "PASTE_YOUR_KEY_HERE" : formatSettingValue(type, currentValue);
-    await window.roamAlphaAPI.data.block.create({
-      location: { "parent-uid": pageUid, order },
-      block: { uid: blockUid, string: `${graphKey}:: ${placeholder}` },
-    });
-    // Add description as a child block
-    const descUid = window.roamAlphaAPI.util.generateUID();
-    await window.roamAlphaAPI.data.block.create({
-      location: { "parent-uid": blockUid, order: 0 },
-      block: { uid: descUid, string: description },
-    });
-    return blockUid;
-  }
-
-  /* Write a single setting back to its graph block (called when toggle cmd
-   * flips the value, so the page stays in sync with cmd palette state). */
-  async function persistSettingToGraph(graphKey) {
-    const row = GRAPH_SETTINGS.find(r => r[0] === graphKey);
-    if (!row) return;
-    const [, settingsKey, type] = row;
-    const value = state.settings[settingsKey];
-    const safeName = state.settings.settingsPage.replaceAll('"', '\\"');
-    try {
-      const rows = window.roamAlphaAPI.data.q(`
-        [:find ?u
-         :where
-         [?p :node/title "${safeName}"]
-         [?b :block/page ?p]
-         [?b :block/uid ?u]
-         [?b :block/string ?s]
-         [(clojure.string/starts-with? ?s "${graphKey}::")]]
-      `);
-      const blockUid = rows?.[0]?.[0];
-      if (!blockUid) return; // page not bootstrapped yet, fine
-      await window.roamAlphaAPI.data.block.update({
-        block: { uid: blockUid, string: `${graphKey}:: ${formatSettingValue(type, value)}` },
-      });
-    } catch (e) {
-      log("debug", `persistSettingToGraph(${graphKey}) failed`, e?.message || e);
+  
+    function formatSettingValue(type, value) {
+      if (type === "bool") return value ? "true" : "false";
+      return String(value);
     }
-  }
-
-  /* Idempotent: ensure the settings page exists with all GRAPH_SETTINGS
-   * blocks. Pre-existing blocks aren't touched. */
-  async function ensureSettingsPage(openInSidebar = true) {
-    const pageName = state.settings.settingsPage;
-    const safeName = pageName.replaceAll('"', '\\"');
-    let pageUid;
-    try {
-      const rows = window.roamAlphaAPI.data.q(`
-        [:find ?u
-         :where
-         [?p :node/title "${safeName}"]
-         [?p :block/uid ?u]]
-      `);
-      pageUid = rows?.[0]?.[0];
-    } catch {}
-    if (!pageUid) {
-      pageUid = window.roamAlphaAPI.util.generateUID();
-      await window.roamAlphaAPI.data.page.create({
-        page: { title: pageName, uid: pageUid },
-      });
-    }
-    // Header help block (only if missing)
-    const headerRows = window.roamAlphaAPI.data.q(`
-      [:find ?u
-       :where
-       [?p :node/title "${safeName}"]
-       [?b :block/page ?p]
-       [?b :block/uid ?u]
-       [?b :block/string ?s]
-       [(clojure.string/starts-with? ?s "**How to use this page**")]]
-    `);
-    if (!headerRows?.[0]?.[0]) {
-      const headerUid = window.roamAlphaAPI.util.generateUID();
-      await window.roamAlphaAPI.data.block.create({
-        location: { "parent-uid": pageUid, order: 0 },
-        block: { uid: headerUid, string: "**How to use this page** — every setting below is `key:: value`. Edit the value inline (click the block, change the text, click out). The script reloads from this page every 15 min, or instantly via cmd palette → \"Auto-Attribute: reload settings from graph\". Bool keys: `true` or `false`. Numbers as plain digits. Description of each setting is the child block." },
-      });
-    }
-    // Bootstrap each setting block in order
-    let order = 1;
-    let firstNewBlock = null;
-    for (const [graphKey, settingsKey, type, , description] of GRAPH_SETTINGS) {
-      const before = window.roamAlphaAPI.data.q(`
-        [:find ?u
-         :where
-         [?p :node/title "${safeName}"]
-         [?b :block/page ?p]
-         [?b :block/uid ?u]
-         [?b :block/string ?s]
-         [(clojure.string/starts-with? ?s "${graphKey}::")]]
-      `)?.[0]?.[0];
-      const blockUid = await ensureSettingsBlock(
-        pageUid, graphKey, type, state.settings[settingsKey], description, order
-      );
-      if (!before && !firstNewBlock) firstNewBlock = blockUid;
-      order++;
-    }
-    if (openInSidebar) {
-      const targetUid = firstNewBlock || pageUid;
+  
+    function loadPersistentSettings() {
       try {
-        await window.roamAlphaAPI.ui.rightSidebar.addWindow({
-          window: { type: firstNewBlock ? "block" : "outline", "block-uid": targetUid },
+        const raw = localStorage.getItem(sk("settings"));
+        if (!raw) return;
+        const stored = JSON.parse(raw);
+        for (const [, settingsKey] of GRAPH_SETTINGS) {
+          if (stored[settingsKey] !== undefined) settingsRef[settingsKey] = stored[settingsKey];
+        }
+      } catch (e) { log("warn", "loadPersistentSettings failed", e); }
+    }
+  
+    function persistSettings() {
+      try {
+        const obj = {};
+        for (const [, settingsKey] of GRAPH_SETTINGS) obj[settingsKey] = settingsRef[settingsKey];
+        localStorage.setItem(sk("settings"), JSON.stringify(obj));
+      } catch (e) { log("warn", "persistSettings failed", e); }
+    }
+  
+    function loadAllSettingsFromGraph() {
+      try {
+        const safeName = SETTINGS_PAGE.replaceAll('"', '\\"');
+        const rows = window.roamAlphaAPI.data.q(`
+          [:find ?s :where [?p :node/title "${safeName}"] [?b :block/page ?p] [?b :block/string ?s]]
+        `);
+        const blocksByKey = {};
+        for (const r of rows) {
+          const s = (r[0] || "").trim();
+          const m = s.match(/^([a-z_][a-z0-9_]*)::\s*(.*)$/i);
+          if (m) blocksByKey[m[1]] = m[2];
+        }
+        let updated = 0;
+        for (const [graphKey, settingsKey, type] of GRAPH_SETTINGS) {
+          if (!(graphKey in blocksByKey)) continue;
+          const raw = blocksByKey[graphKey];
+          if (graphKey === "gemini_api_key" && (raw === "" || raw === "PASTE_YOUR_KEY_HERE")) continue;
+          const parsed = parseSettingValue(type, raw);
+          if (parsed === null) continue;
+          if (settingsRef[settingsKey] === parsed) continue;
+          settingsRef[settingsKey] = parsed;
+          updated++;
+        }
+        if (updated > 0) {
+          persistSettings();
+          log("info", `loaded ${updated} setting(s) from [[${SETTINGS_PAGE}]]`);
+        }
+        return updated;
+      } catch (e) { log("debug", "loadAllSettingsFromGraph failed", e); return 0; }
+    }
+  
+    async function ensureSettingsBlock(pageUid, graphKey, type, currentValue, description, order) {
+      const safeName = SETTINGS_PAGE.replaceAll('"', '\\"');
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?u :where [?p :node/title "${safeName}"] [?b :block/page ?p] [?b :block/uid ?u] [?b :block/string ?s] [(clojure.string/starts-with? ?s "${graphKey}::")]]
+      `);
+      let blockUid = rows?.[0]?.[0];
+      if (blockUid) return blockUid;
+      blockUid = window.roamAlphaAPI.util.generateUID();
+      const placeholder = (graphKey === "gemini_api_key" && !currentValue) ? "PASTE_YOUR_KEY_HERE" : formatSettingValue(type, currentValue);
+      await window.roamAlphaAPI.data.block.create({
+        location: { "parent-uid": pageUid, order },
+        block: { uid: blockUid, string: `${graphKey}:: ${placeholder}` },
+      });
+      const descUid = window.roamAlphaAPI.util.generateUID();
+      await window.roamAlphaAPI.data.block.create({
+        location: { "parent-uid": blockUid, order: 0 },
+        block: { uid: descUid, string: description },
+      });
+      return blockUid;
+    }
+  
+    async function persistSettingToGraph(graphKey) {
+      const row = GRAPH_SETTINGS.find(r => r[0] === graphKey);
+      if (!row) return;
+      const [, settingsKey, type] = row;
+      const value = settingsRef[settingsKey];
+      const safeName = SETTINGS_PAGE.replaceAll('"', '\\"');
+      try {
+        const rows = window.roamAlphaAPI.data.q(`
+          [:find ?u :where [?p :node/title "${safeName}"] [?b :block/page ?p] [?b :block/uid ?u] [?b :block/string ?s] [(clojure.string/starts-with? ?s "${graphKey}::")]]
+        `);
+        const blockUid = rows?.[0]?.[0];
+        if (!blockUid) return;
+        await window.roamAlphaAPI.data.block.update({
+          block: { uid: blockUid, string: `${graphKey}:: ${formatSettingValue(type, value)}` },
         });
-      } catch (e) {
-        log("debug", "rightSidebar open failed (try main window)", e);
-        try {
-          await window.roamAlphaAPI.ui.mainWindow.openPage({ page: { uid: pageUid } });
-        } catch (e2) {
-          log("warn", "openPage also failed", e2);
+      } catch (e) { log("debug", `persistSettingToGraph(${graphKey}) failed`, e?.message || e); }
+    }
+  
+    async function ensureSettingsPage(openInSidebar = true) {
+      const safeName = SETTINGS_PAGE.replaceAll('"', '\\"');
+      let pageUid;
+      try {
+        const rows = window.roamAlphaAPI.data.q(`
+          [:find ?u :where [?p :node/title "${safeName}"] [?p :block/uid ?u]]
+        `);
+        pageUid = rows?.[0]?.[0];
+      } catch {}
+      if (!pageUid) {
+        pageUid = window.roamAlphaAPI.util.generateUID();
+        await window.roamAlphaAPI.data.page.create({ page: { title: SETTINGS_PAGE, uid: pageUid } });
+      }
+      const headerRows = window.roamAlphaAPI.data.q(`
+        [:find ?u :where [?p :node/title "${safeName}"] [?b :block/page ?p] [?b :block/uid ?u] [?b :block/string ?s] [(clojure.string/starts-with? ?s "**How to use this page**")]]
+      `);
+      if (!headerRows?.[0]?.[0]) {
+        const headerUid = window.roamAlphaAPI.util.generateUID();
+        await window.roamAlphaAPI.data.block.create({
+          location: { "parent-uid": pageUid, order: 0 },
+          block: { uid: headerUid, string: "**How to use this page** — every setting below is `key:: value`. Edit the value inline (click the block, change the text, click out). The script reloads from this page on each scan cycle, or instantly via the matching cmd palette \"reload settings from graph\" command. Bool keys: `true` or `false`. Numbers as plain digits." },
+        });
+      }
+      let order = 1;
+      for (const [graphKey, settingsKey, type, , description] of GRAPH_SETTINGS) {
+        await ensureSettingsBlock(pageUid, graphKey, type, settingsRef[settingsKey], description, order);
+        order++;
+      }
+      if (openInSidebar) {
+        try { await window.roamAlphaAPI.ui.rightSidebar.addWindow({ window: { type: "outline", "block-uid": pageUid } }); }
+        catch (e) {
+          try { await window.roamAlphaAPI.ui.mainWindow.openPage({ page: { uid: pageUid } }); } catch {}
         }
       }
+      return pageUid;
     }
-    return pageUid;
+  
+    return {
+      parseSettingValue, formatSettingValue,
+      loadPersistentSettings, persistSettings,
+      loadAllSettingsFromGraph, ensureSettingsBlock,
+      persistSettingToGraph, ensureSettingsPage,
+    };
   }
+  // === SETTINGS-PAGE LIB END v1.0.0 ===
+  const _settingsMgr = createSettingsManager({
+    SETTINGS_PAGE, GRAPH_SETTINGS,
+    settingsRef: state.settings,
+    log,
+    sk,
+  });
+  const {
+    loadPersistentSettings, persistSettings,
+    loadAllSettingsFromGraph, persistSettingToGraph, ensureSettingsPage,
+  } = _settingsMgr;
+
 
   function resetCallsIfNewDay() {
     const today = new Date().toDateString();

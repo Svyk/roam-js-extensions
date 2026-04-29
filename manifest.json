@@ -2,11 +2,11 @@
   "manifest_version": 1,
   "repo": "Svyk/roam-js-extensions",
   "raw_base": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main",
-  "updated": "2026-04-28",
+  "updated": "2026-04-29",
   "scripts": [
     {
       "name": "auto-attribute-todo",
-      "version": "1.7.4",
+      "version": "1.7.5",
       "namespace": "auto-attr-todo",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/auto-attribute-todo/script.js",
       "description": "Auto-fills BT_attr* on new {{[[TODO]]}} blocks via LiveAI_API. Phase 3 semantic embeddings via Gemini.",
@@ -16,7 +16,7 @@
     },
     {
       "name": "explain-block",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "namespace": "explain-block",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/explain-block/script.js",
       "description": "Brief / detailed / translate / critique / define-terms passes on focused block.",
@@ -25,7 +25,7 @@
     },
     {
       "name": "triage-ptn",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "namespace": "triage-ptn",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/triage-ptn/script.js",
       "description": "Classifies #ptn captures and proposes a route. Date-bucketed log + auto-archive.",
@@ -35,7 +35,7 @@
     },
     {
       "name": "daily-summary",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "namespace": "daily-summary",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/daily-summary/script.js",
       "description": "2-sentence today's-vibe block at top of daily page (manual trigger). Tomorrow-prep too.",
@@ -44,7 +44,7 @@
     },
     {
       "name": "lori-review-button",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "namespace": "lori-review-button",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/lori-review-button/script.js",
       "description": "Lori-Boyd-style 6-pass QA review on current page (manual trigger).",
@@ -53,7 +53,7 @@
     },
     {
       "name": "update-roam-js",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "namespace": "update-roam-js",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/update-roam-js/script.js",
       "description": "Self-bootstrapper + auto-updater for the suite. Install this one first.",
