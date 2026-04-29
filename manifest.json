@@ -2,57 +2,63 @@
   "manifest_version": 1,
   "repo": "Svyk/roam-js-extensions",
   "raw_base": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main",
-  "updated": "2026-04-25",
+  "updated": "2026-04-28",
   "scripts": [
     {
       "name": "auto-attribute-todo",
-      "version": "1.6.0",
+      "version": "1.7.4",
       "namespace": "auto-attr-todo",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/auto-attribute-todo/script.js",
-      "description": "Auto-fills BT_attr* on new {{[[TODO]]}} blocks via LiveAI_API.",
+      "description": "Auto-fills BT_attr* on new {{[[TODO]]}} blocks via LiveAI_API. Phase 3 semantic embeddings via Gemini.",
       "auto_runs": true,
-      "daily_call_cap": 100
+      "daily_call_cap": 100,
+      "settings_page": "Auto-Attribute Settings"
     },
     {
       "name": "explain-block",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "namespace": "explain-block",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/explain-block/script.js",
       "description": "Brief / detailed / translate / critique / define-terms passes on focused block.",
-      "auto_runs": false
+      "auto_runs": false,
+      "settings_page": "Explain Block Settings"
     },
     {
       "name": "triage-ptn",
-      "version": "1.0.5",
+      "version": "1.1.0",
       "namespace": "triage-ptn",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/triage-ptn/script.js",
-      "description": "Classifies #ptn captures and proposes a route.",
+      "description": "Classifies #ptn captures and proposes a route. Date-bucketed log + auto-archive.",
       "auto_runs": true,
-      "daily_call_cap": 80
+      "daily_call_cap": 80,
+      "settings_page": "Triage PTN Settings"
     },
     {
       "name": "daily-summary",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "namespace": "daily-summary",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/daily-summary/script.js",
-      "description": "2-sentence today's-vibe block at top of daily page (manual trigger).",
-      "auto_runs": false
+      "description": "2-sentence today's-vibe block at top of daily page (manual trigger). Tomorrow-prep too.",
+      "auto_runs": false,
+      "settings_page": "Daily Summary Settings"
     },
     {
       "name": "lori-review-button",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "namespace": "lori-review-button",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/lori-review-button/script.js",
       "description": "Lori-Boyd-style 6-pass QA review on current page (manual trigger).",
-      "auto_runs": false
+      "auto_runs": false,
+      "settings_page": "Lori Review Settings"
     },
     {
       "name": "update-roam-js",
-      "version": "1.0.1",
+      "version": "1.1.0",
       "namespace": "update-roam-js",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/update-roam-js/script.js",
       "description": "Self-bootstrapper + auto-updater for the suite. Install this one first.",
-      "auto_runs": false
+      "auto_runs": false,
+      "settings_page": "Update Roam JS Settings"
     }
   ]
 }

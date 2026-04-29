@@ -19,6 +19,22 @@ All five share a design pattern:
 - Logs each call to a dedicated `[[<name> Log]]` page in your graph for audit
 - Command-palette hooks for manual triggers + stats + toggle-enabled
 - Clean unload via `window.<NAMESPACE>_cleanup()`
+- **Unified settings page** — every plugin auto-creates a dedicated `[[<Plugin> Settings]]` page on first run with every toggle as an inline-editable `key:: value` block. Edit the block, the script picks it up. Changes via cmd palette write back to the page. Source of truth lives in the graph.
+
+## Settings pages
+
+Each plugin has a dedicated settings page in your Roam graph. Open via cmd palette → `<Plugin>: open settings page (edit toggles inline)`. Edit values inline; the script reloads on the next scan or instantly via the matching `reload settings from graph` cmd.
+
+| Plugin | Settings page |
+|---|---|
+| auto-attribute-todo | `[[Auto-Attribute Settings]]` |
+| triage-ptn | `[[Triage PTN Settings]]` |
+| daily-summary | `[[Daily Summary Settings]]` |
+| explain-block | `[[Explain Block Settings]]` |
+| lori-review-button | `[[Lori Review Settings]]` |
+| update-roam-js | `[[Update Roam JS Settings]]` |
+
+To check current state of any toggle at a glance: open the settings page, look at the value, OR run cmd palette → `<Plugin>: show stats (current settings)` for a formatted ON/OFF panel.
 
 ---
 
