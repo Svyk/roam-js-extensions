@@ -6,7 +6,7 @@
   "scripts": [
     {
       "name": "timeblock-organizer",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "namespace": "timeblock-organizer",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/timeblock-organizer/script.js",
       "description": "Pull-watches daily pages and reorganizes time-prefixed TODOs into the #TimeBlock parent, sorted by start-time, with the SmartBlock timestamp button pinned last. Fixes scheduling bugs in any writer (Chief of Staff, Better Tasks, manual edits). v1.1.0 adds conflict detection + opt-in auto-resolve via bump_forward cascade.",

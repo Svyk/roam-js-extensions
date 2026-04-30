@@ -1,4 +1,21 @@
-/* timeblock-organizer v1.1.0
+/* timeblock-organizer v1.1.1
+ *
+ * v1.1.1 — Bugfix: relaxed TIME_PREFIX_RE so it matches all five canonical
+ *   TimeBlock entry formats, not just inline-TODO entries. The prior regex
+ *   required `HH:MM - HH:MM ` followed IMMEDIATELY by `{{[[TODO]]}}`, which
+ *   excluded:
+ *     - block-ref entries: `HH:MM - HH:MM ((uid))`
+ *     - markdown-link wrapped block refs: `HH:MM - HH:MM [text](((uid)))`
+ *     - meeting/event entries: `HH:MM - HH:MM **call with X**`
+ *     - any plain-text time-prefixed line
+ *   Fix: regex now matches `HH:MM - HH:MM ` followed by any content (positive
+ *   lookahead `(?=\S)`). Bare `HH:MM - HH:MM` alone with no description still
+ *   doesn't match (intentional — incomplete entry). rewriteTimePrefix
+ *   simplified to a literal string replacement; no longer rebuilds TODO/DONE
+ *   markers from scratch (they live AFTER the prefix and survive verbatim).
+ *   Repro that prompted the fix: ((HU-11_ihG)) — `23:00 - 23:45 [{{[[TODO]]}}
+ *   ...](((OImadoY9X))) #important` was sitting mid-stack in TimeBlock when
+ *   it should've sorted to position N-1 (just before the SmartBlock button).
  *
  * v1.1.0 — Phase 2 + Phase 3 ship.
  *   Phase 2 (conflict detection): after each reconcile, scan the sorted
@@ -31,7 +48,7 @@
  * No LLM call. Pure Roam datalog + block.move/update. Cost: $0.
  */
 ;(function () {
-  const VERSION = "1.1.0";
+  const VERSION = "1.1.1";
   const NAMESPACE = "timeblock-organizer";
   const SETTINGS_PAGE = "TimeBlock Organizer Settings";
 
@@ -354,9 +371,16 @@
   }
 
   /* ---------- parsing ---------- */
-  // Match: HH:MM - HH:MM {{[[TODO]]}} ...    or    HH:MM - HH:MM {{[[DONE]]}} ...
-  // Also tolerate optional whitespace and en-dash.
-  const TIME_PREFIX_RE = /^(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})\s+\{\{\[\[(?:TODO|DONE)\]\]\}\}/;
+  // Match: HH:MM - HH:MM <anything> — accepts ALL valid TimeBlock entry formats:
+  //   - HH:MM - HH:MM {{[[TODO]]}} description       (inline TODO)
+  //   - HH:MM - HH:MM {{[[DONE]]}} description       (inline DONE)
+  //   - HH:MM - HH:MM ((block-uid))                  (block ref)
+  //   - HH:MM - HH:MM [text](((block-uid)))          (markdown-link wrapped block ref)
+  //   - HH:MM - HH:MM **bold meeting** description   (meeting/event)
+  //   - HH:MM - HH:MM plain text description         (any other entry)
+  // Lookahead `(?=\S)` requires content after the time range — bare `HH:MM - HH:MM`
+  // alone won't match. Tolerates en-dash and optional whitespace around the dash.
+  const TIME_PREFIX_RE = /^(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})\s+(?=\S)/;
 
   function parseTimePrefix(blockString) {
     if (!blockString) return null;
@@ -397,15 +421,15 @@
     return h * 60 + mm;
   }
 
-  /* Replace the leading "HH:MM - HH:MM" in a TODO/DONE block with new times. */
+  /* Replace the leading "HH:MM - HH:MM " prefix with new times.
+   * The TIME_PREFIX_RE match consumes the time range AND the trailing whitespace
+   * (lookahead `(?=\S)` doesn't consume the content), so the rest of the block
+   * string — TODO marker, block ref, markdown link, tags, anything — survives
+   * verbatim. Drop-in safe across all five TimeBlock entry formats. */
   function rewriteTimePrefix(blockString, newStartMin, newEndMin) {
     const sh = formatMinAsHHMM(newStartMin);
     const eh = formatMinAsHHMM(newEndMin);
-    return blockString.replace(TIME_PREFIX_RE, (match) => {
-      const markerMatch = match.match(/\{\{\[\[(?:TODO|DONE)\]\]\}\}/);
-      const marker = markerMatch ? markerMatch[0] : "{{[[TODO]]}}";
-      return `${sh} - ${eh} ${marker}`;
-    });
+    return blockString.replace(TIME_PREFIX_RE, `${sh} - ${eh} `);
   }
 
   /* ---------- Phase 2: conflict detection ---------- */
