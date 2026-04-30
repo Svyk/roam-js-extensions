@@ -15,7 +15,7 @@
     },
     {
       "name": "auto-attribute-todo",
-      "version": "1.7.5",
+      "version": "1.7.6",
       "namespace": "auto-attr-todo",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/auto-attribute-todo/script.js",
       "description": "Auto-fills BT_attr* on new {{[[TODO]]}} blocks via LiveAI_API. Phase 3 semantic embeddings via Gemini.",

@@ -1,4 +1,17 @@
-/* auto-attribute-todo v1.7.4
+/* auto-attribute-todo v1.7.6
+ *
+ * v1.7.6 — Bugfix: ReferenceError on init. The v1.7.5 settings-page-lib
+ *   refactor introduced `createSettingsManager({SETTINGS_PAGE, GRAPH_SETTINGS,
+ *   ...})` using object-property-shorthand, but never declared a top-level
+ *   `const SETTINGS_PAGE` (auto-attribute-todo had been using
+ *   `state.settings.settingsPage` since v1.7.4). Result: ReferenceError on
+ *   init, IIFE bailed out, no commands registered, no pull-watch, no scan.
+ *   Fix: add `const SETTINGS_PAGE = "Auto-Attribute Settings"` matching the
+ *   other 5 plugins' convention. Behavior identical to v1.7.5 once running.
+ *
+ * v1.7.5 — Refactor: settings-page helpers extracted into _lib/settings-page.js
+ *   factory, inlined into each plugin via sync-settings-lib.sh. Single source
+ *   of truth for the helpers, deployed bytes still self-contained.
  *
  * v1.7.4 — Unified settings page. Every user-controllable setting now lives
  * on [[Auto-Attribute Settings]] as a `key:: value` block (one block per
@@ -197,9 +210,10 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.7.5";
+  const VERSION = "1.7.6";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
+  const SETTINGS_PAGE = "Auto-Attribute Settings";
 
   const DEFAULTS = {
     enabled: true,
