@@ -14,7 +14,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 LIB="$REPO_ROOT/_lib/settings-page.js"
-PLUGINS=(auto-attribute-todo triage-ptn explain-block lori-review-button daily-summary update-roam-js timeblock-organizer)
+PLUGINS=(auto-attribute-todo explain-block lori-review-button daily-summary update-roam-js timeblock-organizer)
 
 if [[ ! -f "$LIB" ]]; then
   echo "ERROR: $LIB not found"

@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "repo": "Svyk/roam-js-extensions",
   "raw_base": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main",
-  "updated": "2026-04-29",
+  "updated": "2026-04-30",
   "scripts": [
     {
       "name": "timeblock-organizer",
@@ -31,16 +31,6 @@
       "description": "Brief / detailed / translate / critique / define-terms passes on focused block.",
       "auto_runs": false,
       "settings_page": "Explain Block Settings"
-    },
-    {
-      "name": "triage-ptn",
-      "version": "1.1.1",
-      "namespace": "triage-ptn",
-      "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/triage-ptn/script.js",
-      "description": "Classifies #ptn captures and proposes a route. Date-bucketed log + auto-archive.",
-      "auto_runs": true,
-      "daily_call_cap": 80,
-      "settings_page": "Triage PTN Settings"
     },
     {
       "name": "daily-summary",

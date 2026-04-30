@@ -1,6 +1,6 @@
 # Roam JS Extensions — LiveAI_API integrations
 
-Five `roam/js` scripts that hook `window.LiveAI_API.generate()` into your daily Roam workflow. Each is self-contained, idempotent, and silent until needed.
+Six `roam/js` scripts that hook `window.LiveAI_API.generate()` into your daily Roam workflow. Each is self-contained, idempotent, and silent until needed.
 
 ## What's in here
 
@@ -8,12 +8,12 @@ Five `roam/js` scripts that hook `window.LiveAI_API.generate()` into your daily 
 |---|---|---|---|
 | **auto-attribute-todo** | Detects new `{{[[TODO]]}}` blocks → auto-fills `BT_attrProject`, `BT_attrDue`, `BT_attrPriority`, `BT_attrEnergy`, `BT_attrContext` as children | automatic on TODO create + 5-min safety scan | ~$0.001 (Haiku) |
 | **explain-block** | Brief / detailed / translate / Lori-critique / define-terms passes on the focused block | command palette: `Explain block …` | ~$0.001-0.005 |
-| **triage-ptn** | Classifies `#ptn` mobile captures as task / journal / decision / reference / obsolete and proposes a route | automatic on `#ptn` tag + 10-min scan | ~$0.001 |
 | **daily-summary** | Inserts a 2-sentence "today's vibe" block at the top of today's daily page | command palette: `Daily Summary: refresh …` | ~$0.005 |
 | **lori-review-button** | Runs Lori-Boyd-style 6-pass QA review on the current page (SOPs, deviations, EMP docs) | command palette: `Lori Review …` | ~$0.01-0.05 |
 | **timeblock-organizer** | Watches daily pages; pulls time-prefixed TODOs into the `#TimeBlock` Nautilus parent, sorts by start-time, pins the SmartBlock timestamp button as last child | automatic on daily-page block changes (debounced 8s) + 5-min sweep | $0 (no LLM) |
+| **update-roam-js** | Self-bootstrapper + auto-updater for the suite. Install this one first. | command palette: `Update Roam JS …` | $0 (no LLM) |
 
-All five share a design pattern:
+All share a design pattern:
 - IIFE-wrapped, no global pollution beyond `window.<NAMESPACE>_state` for debugging
 - Daily-cap guardrails on AI calls (~50-100/day per script)
 - localStorage-based dedup (re-runs skip already-processed blocks)
@@ -29,7 +29,6 @@ Each plugin has a dedicated settings page in your Roam graph. Open via cmd palet
 | Plugin | Settings page |
 |---|---|
 | auto-attribute-todo | `[[Auto-Attribute Settings]]` |
-| triage-ptn | `[[Triage PTN Settings]]` |
 | daily-summary | `[[Daily Summary Settings]]` |
 | explain-block | `[[Explain Block Settings]]` |
 | lori-review-button | `[[Lori Review Settings]]` |
