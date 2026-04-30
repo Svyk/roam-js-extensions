@@ -1,4 +1,16 @@
-/* timeblock-organizer v1.1.1
+/* timeblock-organizer v1.1.2
+ *
+ * v1.1.2 — Chief of Staff compatibility. COS's `roam_create_todo` tool
+ *   prepends `{{[[TODO]]}} ` to whatever text the agent passes, so a COS-
+ *   scheduled item ends up shaped `{{[[TODO]]}} HH:MM - HH:MM description`
+ *   — TODO marker FIRST, time range SECOND. v1.1.1's regex required the
+ *   time range to be at position 0 of the string, so COS items got treated
+ *   as `tbOther` and never sorted. Added TODO_TIME_PREFIX_RE that catches
+ *   the marker-first shape. parseTimePrefix tries canonical first, falls
+ *   back to tool-prefixed. rewriteTimePrefix preserves whichever shape was
+ *   used (won't rewrite COS output to canonical — that'd surprise the user).
+ *   Now reconciles + sorts ANY writer's output: COS, Better Tasks dropdowns,
+ *   manual edits, future skills.
  *
  * v1.1.1 — Bugfix: relaxed TIME_PREFIX_RE so it matches all five canonical
  *   TimeBlock entry formats, not just inline-TODO entries. The prior regex
@@ -48,7 +60,7 @@
  * No LLM call. Pure Roam datalog + block.move/update. Cost: $0.
  */
 ;(function () {
-  const VERSION = "1.1.1";
+  const VERSION = "1.1.2";
   const NAMESPACE = "timeblock-organizer";
   const SETTINGS_PAGE = "TimeBlock Organizer Settings";
 
@@ -371,23 +383,40 @@
   }
 
   /* ---------- parsing ---------- */
-  // Match: HH:MM - HH:MM <anything> — accepts ALL valid TimeBlock entry formats:
-  //   - HH:MM - HH:MM {{[[TODO]]}} description       (inline TODO)
-  //   - HH:MM - HH:MM {{[[DONE]]}} description       (inline DONE)
-  //   - HH:MM - HH:MM ((block-uid))                  (block ref)
-  //   - HH:MM - HH:MM [text](((block-uid)))          (markdown-link wrapped block ref)
-  //   - HH:MM - HH:MM **bold meeting** description   (meeting/event)
-  //   - HH:MM - HH:MM plain text description         (any other entry)
-  // Lookahead `(?=\S)` requires content after the time range — bare `HH:MM - HH:MM`
-  // alone won't match. Tolerates en-dash and optional whitespace around the dash.
+  // Two accepted shapes for time-prefixed blocks:
+  //   (A) Canonical Svy format — time range FIRST:
+  //         HH:MM - HH:MM <anything>
+  //         HH:MM - HH:MM {{[[TODO]]}} description
+  //         HH:MM - HH:MM ((block-uid))
+  //         HH:MM - HH:MM [text](((block-uid)))
+  //         HH:MM - HH:MM **bold meeting** description
+  //   (B) Tool-prefixed format — TODO/DONE marker FIRST, time range SECOND:
+  //         {{[[TODO]]}} HH:MM - HH:MM description
+  //         {{[[DONE]]}} HH:MM - HH:MM done thing
+  //       Chief of Staff's roam_create_todo and similar writers prepend the
+  //       marker automatically, producing this shape. We sort/reconcile them
+  //       too — without rewriting them to canonical (would surprise the user).
+  // Lookahead `(?=\S)` requires content after the time range — bare
+  // `HH:MM - HH:MM` alone won't match. Tolerates en-dash and optional
+  // whitespace around the dash.
   const TIME_PREFIX_RE = /^(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})\s+(?=\S)/;
+  const TODO_TIME_PREFIX_RE = /^(\{\{\[\[(?:TODO|DONE)\]\]\}\}\s+)(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})\s+(?=\S)/;
 
   function parseTimePrefix(blockString) {
     if (!blockString) return null;
-    const m = blockString.match(TIME_PREFIX_RE);
-    if (!m) return null;
-    const sh = parseInt(m[1], 10), sm = parseInt(m[2], 10);
-    const eh = parseInt(m[3], 10), em = parseInt(m[4], 10);
+    // Try canonical shape (A) first
+    let m = blockString.match(TIME_PREFIX_RE);
+    let sh, sm, eh, em;
+    if (m) {
+      sh = parseInt(m[1], 10); sm = parseInt(m[2], 10);
+      eh = parseInt(m[3], 10); em = parseInt(m[4], 10);
+    } else {
+      // Try tool-prefixed shape (B)
+      m = blockString.match(TODO_TIME_PREFIX_RE);
+      if (!m) return null;
+      sh = parseInt(m[2], 10); sm = parseInt(m[3], 10);
+      eh = parseInt(m[4], 10); em = parseInt(m[5], 10);
+    }
     if (sh > 23 || sm > 59 || eh > 23 || em > 59) return null;
     return { startMin: sh * 60 + sm, endMin: eh * 60 + em };
   }
@@ -421,15 +450,21 @@
     return h * 60 + mm;
   }
 
-  /* Replace the leading "HH:MM - HH:MM " prefix with new times.
-   * The TIME_PREFIX_RE match consumes the time range AND the trailing whitespace
-   * (lookahead `(?=\S)` doesn't consume the content), so the rest of the block
-   * string — TODO marker, block ref, markdown link, tags, anything — survives
-   * verbatim. Drop-in safe across all five TimeBlock entry formats. */
+  /* Replace the leading time range with new times — preserves whichever shape
+   * the block uses (canonical-first or tool-prefixed). Everything after the
+   * time range survives verbatim (TODO marker, block ref, markdown link, tags,
+   * anything). Returns the original string unchanged if neither pattern fits. */
   function rewriteTimePrefix(blockString, newStartMin, newEndMin) {
     const sh = formatMinAsHHMM(newStartMin);
     const eh = formatMinAsHHMM(newEndMin);
-    return blockString.replace(TIME_PREFIX_RE, `${sh} - ${eh} `);
+    if (TIME_PREFIX_RE.test(blockString)) {
+      return blockString.replace(TIME_PREFIX_RE, `${sh} - ${eh} `);
+    }
+    if (TODO_TIME_PREFIX_RE.test(blockString)) {
+      // Preserve the marker prefix (capture group 1: `{{[[TODO]]}} ` or `{{[[DONE]]}} `)
+      return blockString.replace(TODO_TIME_PREFIX_RE, (_match, marker) => `${marker}${sh} - ${eh} `);
+    }
+    return blockString;
   }
 
   /* ---------- Phase 2: conflict detection ---------- */
