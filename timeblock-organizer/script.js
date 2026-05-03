@@ -1,4 +1,20 @@
-/* timeblock-organizer v1.1.2
+/* timeblock-organizer v1.1.3
+ *
+ * v1.1.3 — Two parser fixes that left entries stuck out of order at the
+ *   top of TimeBlock children, surfaced by a 2026-05-02 reconcile of
+ *   ((oNbgd_kU2)):
+ *   (a) `eh > 23` rejection of 24:00 end times. `23:30 - 24:00 EOD wrap`
+ *       failed parseTimePrefix, got bucketed as tbOther, parked at the top
+ *       of the sorted output. 24:00 is canonical end-of-day (1440 min) and
+ *       should be valid as an END time (not a start). Now allows eh=24
+ *       only when em=0; eh > 24 or 24:01+ stays invalid.
+ *   (b) Single-timestamp entries (no range) like `20:51 {{⇥🕞:SmartBlock:
+ *       Elapsed time}} ...` from SmartBlock click-loggers were treated as
+ *       tbOther and parked at the top. Added SINGLE_TIME_PREFIX_RE as the
+ *       third parse fallback. Treated as zero-duration points: sort by
+ *       start time, never overlap (filter on endMin > startMin in
+ *       detectOverlaps), never auto-bumped (rewriteTimePrefix doesn't
+ *       handle the single shape — leaves them where the user put them).
  *
  * v1.1.2 — Chief of Staff compatibility. COS's `roam_create_todo` tool
  *   prepends `{{[[TODO]]}} ` to whatever text the agent passes, so a COS-
@@ -60,7 +76,7 @@
  * No LLM call. Pure Roam datalog + block.move/update. Cost: $0.
  */
 ;(function () {
-  const VERSION = "1.1.2";
+  const VERSION = "1.1.3";
   const NAMESPACE = "timeblock-organizer";
   const SETTINGS_PAGE = "TimeBlock Organizer Settings";
 
@@ -401,6 +417,13 @@
   // whitespace around the dash.
   const TIME_PREFIX_RE = /^(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})\s+(?=\S)/;
   const TODO_TIME_PREFIX_RE = /^(\{\{\[\[(?:TODO|DONE)\]\]\}\}\s+)(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})\s+(?=\S)/;
+  // v1.1.3 (C) Single-timestamp entries — SmartBlock elapsed-time logs
+  // and similar point-in-time markers. Zero duration → sort-only support;
+  // detectOverlaps filters on endMin > startMin so they never conflict;
+  // rewriteTimePrefix tests RANGE patterns first and falls through, so
+  // single-stamp entries are never auto-bumped (the user's choice of when
+  // they clicked the timestamp is preserved).
+  const SINGLE_TIME_PREFIX_RE = /^(\d{1,2}):(\d{2})\s+(?=\S)/;
 
   function parseTimePrefix(blockString) {
     if (!blockString) return null;
@@ -413,11 +436,21 @@
     } else {
       // Try tool-prefixed shape (B)
       m = blockString.match(TODO_TIME_PREFIX_RE);
-      if (!m) return null;
-      sh = parseInt(m[2], 10); sm = parseInt(m[3], 10);
-      eh = parseInt(m[4], 10); em = parseInt(m[5], 10);
+      if (m) {
+        sh = parseInt(m[2], 10); sm = parseInt(m[3], 10);
+        eh = parseInt(m[4], 10); em = parseInt(m[5], 10);
+      } else {
+        // Try single-timestamp shape (C). Zero duration: endMin == startMin.
+        m = blockString.match(SINGLE_TIME_PREFIX_RE);
+        if (!m) return null;
+        sh = parseInt(m[1], 10); sm = parseInt(m[2], 10);
+        eh = sh; em = sm;
+      }
     }
-    if (sh > 23 || sm > 59 || eh > 23 || em > 59) return null;
+    // v1.1.3: 24:00 is canonical end-of-day (1440 min) and must be allowed
+    // as an END time (not start). 24:01+ stays invalid.
+    if (sh > 23 || sm > 59 || em > 59) return null;
+    if (eh > 24 || (eh === 24 && em > 0)) return null;
     return { startMin: sh * 60 + sm, endMin: eh * 60 + em };
   }
 
