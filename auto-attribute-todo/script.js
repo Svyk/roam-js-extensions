@@ -1,4 +1,11 @@
-/* auto-attribute-todo v1.7.8
+/* auto-attribute-todo v1.7.9
+ *
+ * v1.7.9 — Hotfix: v1.7.8 had 3 literal triple-backtick sequences (1 in a
+ *   comment, 2 in string literals) that terminated the outer Roam markdown
+ *   code fence mid-script — half the source rendered as plain Roam blocks.
+ *   Replaced with `\`.repeat(3)` form (same approach as the existing
+ *   v1.0.5 fix; that changelog entry already warned about this exact
+ *   collision and the rule got broken in v1.7.8). No behavior change.
  *
  * v1.7.8 — Merge: Svyat's parallel v1.7.7 defenses (length cap + code-fence
  *   check inside `isTodo`) joined with this file's structural exclusion
@@ -28,7 +35,7 @@
  *        `isTodo` — covers the pull-watch and cmd-palette entry points
  *        that bypass `findAllTodos`. Also excludes the plugin's own
  *        SETTINGS_PAGE / LOG_PAGE / corrections page, and any block whose
- *        text starts with a fenced code block (```), so plugin source
+ *        text starts with a fenced code block (triple-backtick), so plugin source
  *        pasted on a non-roam page (rare but possible) is still skipped.
  *     3. New cmd palette command "cleanup misattributed roam/js blocks
  *        (one-time)" — finds every BT_attr child currently attached to a
@@ -248,7 +255,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.7.8";
+  const VERSION = "1.7.9";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -587,7 +594,7 @@
   // here saves the page-title pull and any LLM call downstream.
   const isTodo = (s) => {
     if (!s) return false;
-    if (s.trimStart().startsWith("```")) return false;
+    if (s.trimStart().startsWith("`".repeat(3))) return false;
     if (s.length > 5000) return false;
     return s.includes("{{[[TODO]]}}");
   };
@@ -629,7 +636,7 @@
 
   function looksLikeCodeBlock(s) {
     if (!s) return false;
-    return s.trimStart().startsWith("```");
+    return s.trimStart().startsWith("`".repeat(3));
   }
 
   function isExcludedFromAttribution(uid, text) {
