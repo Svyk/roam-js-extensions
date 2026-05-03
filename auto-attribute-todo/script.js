@@ -1,4 +1,20 @@
-/* auto-attribute-todo v1.7.9
+/* auto-attribute-todo v1.7.10
+ *
+ * v1.7.10 — Default cleanTodoText to false. The LLM stage of the cleanup
+ *   was reading user-typed parenthetical content `(...)` and `#tag`s as
+ *   "redundant" once BT_attrNotes / BT_attrProject captured the same
+ *   information, then silently overwriting the parent block to strip
+ *   them. Reproduced 2026-05-02 with B2 backup task on a future daily
+ *   page: `{{[[TODO]]}} Set up B2 restic backup for ~/.claude-mem (replace
+ *   abandoned git backups) #infrastructure` → `{{[[TODO]]}} Set up B2
+ *   restic backup for ~/.claude-mem`. The plugin's own changelog said
+ *   "conservative — only cleans when AI is confident the removed phrase
+ *   is captured in attributes" but the AI is too aggressive about that
+ *   judgment. User toggle (`Auto-Attribute: toggle clean-text`) still
+ *   works for opt-in. Settings page schema description updated to warn.
+ *   Existing graphs with `clean_todo_text:: true` keep that value (graph
+ *   wins over default); flip the block to `false` on the page or via the
+ *   cmd palette toggle to inherit the new default.
  *
  * v1.7.9 — Hotfix: v1.7.8 had 3 literal triple-backtick sequences (1 in a
  *   comment, 2 in string literals) that terminated the outer Roam markdown
@@ -255,7 +271,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.7.9";
+  const VERSION = "1.7.10";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -274,7 +290,7 @@
     contextPathDepth: 5,
     contextChildren: true,
     contextSiblings: true,
-    cleanTodoText: true,
+    cleanTodoText: false,        // v1.7.10: default OFF — LLM was stripping user-typed parens content + #tags as "redundant" once BT_attrNotes/Project captured them, mutating titles in non-obvious ways. User toggle still works for opt-in.
     useDropdown: true,
     activeProjectsHub: "Active Projects",
     syncHubOnScan: true,
@@ -349,7 +365,7 @@
     // Core toggles — flip ON/OFF inline
     ["enabled",                "enabled",                "bool",   true,  "Master switch. false = the script ignores all TODOs."],
     ["auto_create_projects",   "autoCreateProjects",     "bool",   true,  "When AI suggests a new project that doesn't exist, auto-create the page (Project Status:: Active)."],
-    ["clean_todo_text",        "cleanTodoText",          "bool",   true,  "Rewrite the TODO title to remove hints captured into BT_attr children (e.g. 'tomorrow' → captured in BT_attrDue)."],
+    ["clean_todo_text",        "cleanTodoText",          "bool",   false, "Rewrite the TODO title to remove hints captured into BT_attr children. WARNING: the LLM stage interprets '(parens)' content and '#tags' as redundant once BT_attrNotes/Project capture them and silently strips them. Default OFF since v1.7.10. Opt in only if you actively want title cleanup AND keep all critical context outside parens/tags."],
     ["use_dropdown",           "useDropdown",            "bool",   true,  "Emit BT_attrProject as {{or:}} dropdown so you can override the AI pick with one click."],
     ["use_embeddings",         "useEmbeddings",          "bool",   false, "Phase 3 semantic ranker. Requires gemini_api_key. Falls back silently to graph-Jaccard if disabled or fails."],
     ["require_confirmation",   "requireConfirmation",    "bool",   false, "Suggestion-only mode. Logs the AI's pick but doesn't write BT_attr children. Useful for evaluating accuracy."],
