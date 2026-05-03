@@ -1,4 +1,42 @@
-/* auto-attribute-todo v1.7.6
+/* auto-attribute-todo v1.7.8
+ *
+ * v1.7.8 — Merge: Svyat's parallel v1.7.7 defenses (length cap + code-fence
+ *   check inside `isTodo`) joined with this file's structural exclusion
+ *   (`isExcludedFromAttribution` page-title filter). Belt-and-suspenders:
+ *   `isTodo` rejects fenced code AND blocks > 5000 chars at the cheapest
+ *   layer; `isExcludedFromAttribution` rejects entire pages (roam/*,
+ *   Chief of Staff/*, contextPages, plugin's own pages) at a structural
+ *   layer. Either fix alone covers most cases — together they cover the
+ *   classes the other misses (Svyat's caught long fenced plugin sources;
+ *   page-filter caught short doc blocks with inline-backtick {{[[TODO]]}}).
+ *   Cleanup cmd palette command from v1.7.7 is preserved.
+ *
+ * v1.7.7 — Bugfix: STOP self-attributing. The plugin's own source code (and
+ *   every other roam/js plugin's source) contains the literal string
+ *   `{{[[TODO]]}}` in comments and datalog queries — `findAllTodos` and
+ *   `isTodo` matched on substring inclusion, so the JS source blocks were
+ *   classified as TODOs and decorated with BT_attrDue, BT_attrPriority,
+ *   BT_attrProject, BT_attrNotes children. Those children break the plugin
+ *   when Roam re-evaluates the block (the `auto-attributed (low conf 0.35)`
+ *   comment was the smoking gun: confidence below threshold should never
+ *   have been written, but the source was misclassified as a TODO before
+ *   confidence was even computed). Three-layer fix:
+ *     1. `findAllTodos` datalog now excludes any block whose page title
+ *        starts with `roam/` (catches roam/js, roam/css, roam/files, and
+ *        every plugin's sub-page like roam/js/auto-attribute-todo).
+ *     2. `processBlock` runs `isExcludedFromAttribution(uid, text)` before
+ *        `isTodo` — covers the pull-watch and cmd-palette entry points
+ *        that bypass `findAllTodos`. Also excludes the plugin's own
+ *        SETTINGS_PAGE / LOG_PAGE / corrections page, and any block whose
+ *        text starts with a fenced code block (```), so plugin source
+ *        pasted on a non-roam page (rare but possible) is still skipped.
+ *     3. New cmd palette command "cleanup misattributed roam/js blocks
+ *        (one-time)" — finds every BT_attr child currently attached to a
+ *        block on a roam/* page and deletes them. Reversible via Cmd+Z.
+ *   Why the prior 2 fixes didn't stick: they tightened scoring/dedup
+ *   downstream. The block was still SCANNED, still reached `processBlock`,
+ *   and the LLM still got called. This fix gates the scanner at the
+ *   structural level (page membership), not at content heuristics.
  *
  * v1.7.6 — Bugfix: ReferenceError on init. The v1.7.5 settings-page-lib
  *   refactor introduced `createSettingsManager({SETTINGS_PAGE, GRAPH_SETTINGS,
@@ -210,7 +248,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.7.6";
+  const VERSION = "1.7.8";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -544,7 +582,15 @@
     );
   }
 
-  const isTodo = (s) => !!s && s.includes("{{[[TODO]]}}");
+  // v1.7.8: cheap defense layers run before the substring match.
+  // Fenced-code and >5000-char blocks are never real TODOs; rejecting
+  // here saves the page-title pull and any LLM call downstream.
+  const isTodo = (s) => {
+    if (!s) return false;
+    if (s.trimStart().startsWith("```")) return false;
+    if (s.length > 5000) return false;
+    return s.includes("{{[[TODO]]}}");
+  };
 
   function hasBTProject(blockData) {
     const ch = blockData?.[":block/children"] || [];
@@ -560,6 +606,50 @@
     if (t === state.settings.activeProjectsHub) return true;
     if (t.startsWith("Chief of Staff/")) return true;
     return false;
+  }
+
+  /* v1.7.7 — Source-block immunity. The plugin's own JS source contains
+   * `{{[[TODO]]}}` literally (in comments + datalog queries), so the naive
+   * substring `isTodo` check used to misclassify the source block as a
+   * TODO and write BT_attr children into it — corrupting the plugin. These
+   * helpers gate writes by structural facts (page membership, code-fence
+   * shape) instead of content heuristics. */
+
+  function getBlockPageTitle(uid) {
+    try {
+      const data = window.roamAlphaAPI.data.pull(
+        "[{:block/page [:node/title]}]",
+        [":block/uid", uid]
+      );
+      return data?.[":block/page"]?.[":node/title"] || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function looksLikeCodeBlock(s) {
+    if (!s) return false;
+    return s.trimStart().startsWith("```");
+  }
+
+  function isExcludedFromAttribution(uid, text) {
+    const pageTitle = getBlockPageTitle(uid);
+    if (pageTitle) {
+      if (pageTitle.startsWith("roam/")) return `page "${pageTitle}"`;
+      if (pageTitle.startsWith("Chief of Staff/")) return `page "${pageTitle}"`;
+      if (pageTitle === LOG_PAGE) return `own log page`;
+      if (pageTitle === SETTINGS_PAGE) return `own settings page`;
+      if (pageTitle === state.settings.correctionsPage) return `corrections page`;
+      if (pageTitle === state.settings.activeProjectsHub) return `hub page`;
+      // contextPages are read for LLM context, never written to. Real bug:
+      // Time Block Constraints and Chief of Staff/Memory both got self-
+      // attributed because their documentation blocks contain `{{[[TODO]]}}`
+      // in inline backticks (which are NOT a fenced code block).
+      const contextPages = state.settings.contextPages || [];
+      if (contextPages.includes(pageTitle)) return `context page "${pageTitle}"`;
+    }
+    if (looksLikeCodeBlock(text)) return "fenced code block";
+    return null;
   }
 
   function getActiveProjectsWithAliases() {
@@ -1420,6 +1510,9 @@
 
   function findAllTodos() {
     // Returns recent TODOs first by block edit time. Scan-budget capped at 25.
+    // v1.7.7: exclude blocks on roam/* pages at the datalog level — plugin
+    // sources literally contain "{{[[TODO]]}}" in comments and would otherwise
+    // be picked up and self-attributed.
     try {
       const rows = window.roamAlphaAPI.data.q(`
         [:find ?uid ?edit
@@ -1427,6 +1520,9 @@
          [?b :block/uid ?uid]
          [?b :block/string ?s]
          [(clojure.string/includes? ?s "{{[[TODO]]}}")]
+         [?b :block/page ?p]
+         [?p :node/title ?t]
+         (not [(clojure.string/starts-with? ?t "roam/")])
          [?b :edit/time ?edit]]
       `);
       // Sort newest first, take 25
@@ -1850,6 +1946,13 @@ ${entityListLines}${correctionsBlock}`;
     const data = getBlock(uid);
     if (!data) return;
     const text = data[":block/string"] || "";
+    // v1.7.7: source-block immunity. Catches every entry point (scan,
+    // pull-watch, manual cmd palette) before the LLM is called.
+    const exclusionReason = isExcludedFromAttribution(uid, text);
+    if (exclusionReason) {
+      log("debug", `[${uid}] skipped attribution: ${exclusionReason}`);
+      return;
+    }
     if (!isTodo(text)) return;
     if (text.length < state.settings.minTextLength) return;
     if (hasBTProject(data)) {
@@ -1990,8 +2093,19 @@ ${entityListLines}${correctionsBlock}`;
     add("Auto-Attribute: process focused TODO now", async () => {
       const f = window.roamAlphaAPI.ui.getFocusedBlock();
       if (!f) return log("info", "no focused block");
-      state.processedToday.delete(f["block-uid"]); // allow re-process
-      await processBlock(f["block-uid"]);
+      const uid = f["block-uid"];
+      // v1.7.7: surface a clear refusal if user manually targets a system block.
+      const data = getBlock(uid);
+      const text = data?.[":block/string"] || "";
+      const exclusionReason = isExcludedFromAttribution(uid, text);
+      if (exclusionReason) {
+        const msg = `Refusing to attribute focused block: ${exclusionReason}. Plugin sources and system pages are off-limits.`;
+        log("warn", msg);
+        try { alert(msg); } catch {}
+        return;
+      }
+      state.processedToday.delete(uid); // allow re-process
+      await processBlock(uid);
     });
     // v1.7.4: each toggle persists to BOTH localStorage AND the graph
     // settings page, so [[Auto-Attribute Settings]] always shows current
@@ -2187,13 +2301,18 @@ ${entityListLines}${correctionsBlock}`;
     add("Auto-Attribute: dedupe BT_attr children (cleanup duplicates)", async () => {
       // Scan all TODOs; for each, if it has multiple BT_attrX:: children with
       // the same key, delete all but the first. Reports counts.
+      // v1.7.7: exclude roam/* pages so we don't recurse into misattributed
+      // plugin sources (use the dedicated cleanup cmd for those).
       try {
         const rows = window.roamAlphaAPI.data.q(`
           [:find ?uid
            :where
            [?b :block/uid ?uid]
            [?b :block/string ?s]
-           [(clojure.string/includes? ?s "{{[[TODO]]}}")]]
+           [(clojure.string/includes? ?s "{{[[TODO]]}}")]
+           [?b :block/page ?p]
+           [?p :node/title ?t]
+           (not [(clojure.string/starts-with? ?t "roam/")])]
         `);
         const todoUids = rows.flat();
         if (!confirm(`Scan ${todoUids.length} TODOs for duplicate BT_attr children and delete the duplicates?\n\nKeeps the FIRST occurrence of each BT_attrX:: key, deletes the rest. Reversible by undo (Cmd+Z).`)) return;
@@ -2236,6 +2355,79 @@ ${entityListLines}${correctionsBlock}`;
       } catch (e) {
         log("error", "dedupe failed", e);
         alert("Dedupe failed: " + e.message);
+      }
+    });
+    add("Auto-Attribute: cleanup misattributed roam/js blocks (one-time)", async () => {
+      // v1.7.7: deletes BT_attr children that the pre-fix scanner attached to
+      // blocks on pages that should never have been candidates: roam/*,
+      // Chief of Staff/*, plugin's own pages, and configured contextPages.
+      // Safe to run repeatedly. Reversible via Cmd+Z.
+      try {
+        const ctxPages = state.settings.contextPages || [];
+        const ctxClause = ctxPages
+          .map(p => `[(= ?pageTitle "${p.replaceAll('"', '\\"')}")]`)
+          .join(" ");
+        const orClauses = [
+          `[(clojure.string/starts-with? ?pageTitle "roam/")]`,
+          `[(clojure.string/starts-with? ?pageTitle "Chief of Staff/")]`,
+          `[(= ?pageTitle "${LOG_PAGE.replaceAll('"', '\\"')}")]`,
+          `[(= ?pageTitle "${SETTINGS_PAGE.replaceAll('"', '\\"')}")]`,
+          `[(= ?pageTitle "${(state.settings.correctionsPage || "").replaceAll('"', '\\"')}")]`,
+          `[(= ?pageTitle "${(state.settings.activeProjectsHub || "").replaceAll('"', '\\"')}")]`,
+          ctxClause,
+        ].filter(Boolean).join(" ");
+        const rows = window.roamAlphaAPI.data.q(`
+          [:find ?parentUid ?childUid ?childStr ?pageTitle
+           :where
+           [?b :block/uid ?parentUid]
+           [?b :block/page ?p]
+           [?p :node/title ?pageTitle]
+           (or ${orClauses})
+           [?b :block/children ?c]
+           [?c :block/uid ?childUid]
+           [?c :block/string ?childStr]
+           [(clojure.string/starts-with? ?childStr "BT_attr")]]
+        `);
+        if (rows.length === 0) {
+          const msg = "No BT_attr children found on any roam/* page. Nothing to clean.";
+          log("info", msg);
+          try { alert(msg); } catch {}
+          return;
+        }
+        const byParent = new Map();
+        const byPage = new Map();
+        for (const [pUid, cUid, cStr, pTitle] of rows) {
+          if (!byParent.has(pUid)) byParent.set(pUid, []);
+          byParent.get(pUid).push({ uid: cUid, str: cStr });
+          byPage.set(pUid, pTitle);
+        }
+        const lines = [
+          `Found ${rows.length} BT_attr children on ${byParent.size} block(s) across ${new Set(byPage.values()).size} roam/* page(s):`,
+          ...Array.from(byParent.entries()).map(([pUid, kids]) =>
+            `  • [[${byPage.get(pUid)}]] ((${pUid})) — ${kids.length} child(ren)`
+          ),
+          ``,
+          `Delete all of them? (Cmd+Z reverses individual deletes.)`,
+        ];
+        if (!confirm(lines.join("\n"))) return;
+        let deleted = 0, failed = 0;
+        for (const [, kids] of byParent) {
+          for (const child of kids) {
+            try {
+              await window.roamAlphaAPI.data.block.delete({ block: { uid: child.uid } });
+              deleted++;
+            } catch (e) {
+              failed++;
+              log("warn", `delete ${child.uid} failed`, e?.message || e);
+            }
+          }
+        }
+        const result = `Deleted ${deleted}/${rows.length} BT_attr children. ${failed ? failed + ' failed.' : ''} Refresh Roam to verify.`;
+        log("info", result);
+        try { alert(result); } catch {}
+      } catch (e) {
+        log("error", "cleanup misattributed failed", e);
+        try { alert("Cleanup failed: " + e.message); } catch {}
       }
     });
     add("Auto-Attribute: discover available embedding models (debug)", async () => {
