@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "repo": "Svyk/roam-js-extensions",
   "raw_base": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main",
-  "updated": "2026-04-30",
+  "updated": "2026-05-06",
   "scripts": [
     {
       "name": "timeblock-organizer",
@@ -15,10 +15,10 @@
     },
     {
       "name": "auto-attribute-todo",
-      "version": "1.7.6",
+      "version": "1.8.0",
       "namespace": "auto-attr-todo",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/auto-attribute-todo/script.js",
-      "description": "Auto-fills BT_attr* on new {{[[TODO]]}} blocks via LiveAI_API. Phase 3 semantic embeddings via Gemini.",
+      "description": "Auto-fills BT_attr* on new {{[[TODO]]}} blocks via LiveAI_API. Phase 3 semantic embeddings via Gemini. v1.8.0: log housekeeping (per-day grouping + auto-prune) + ((uid)) block-ref following for stronger project attribution.",
       "auto_runs": true,
       "daily_call_cap": 100,
       "settings_page": "Auto-Attribute Settings"
