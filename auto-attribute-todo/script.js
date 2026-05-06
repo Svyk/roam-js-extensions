@@ -271,7 +271,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.7.10";
+  const VERSION = "1.8.0";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -314,6 +314,14 @@
     embeddingProjectTextChars: 1500, // how much project page text to embed
     embeddingGraphWeight: 0.2,    // tie-breaker weight for graph-Jaccard signal
     settingsPage: "Auto-Attribute Settings", // graph page holding gemini_api_key:: block
+    // ── v1.8.0: log housekeeping ────────────────────────────────────────────
+    logRetentionDays: 30,         // prune day-grouped or flat log entries older than this
+    logGroupByDay: true,          // nest each new entry under [[Month Dth, YYYY]] parent
+    logPruneIntervalMs: 24 * 60 * 60_000, // run prune at most once per day per session
+    // ── v1.8.0: follow ((uid)) block-refs in TODO title for stronger attribution ─
+    followBlockRefs: true,        // resolve ((uid)) refs to surface ref'd text + project hints
+    blockRefMaxDepth: 1,          // how deep to follow chained refs (1 = direct only)
+    blockRefMaxFollow: 5,         // safety cap on number of refs followed per TODO
   };
 
   const state = {
@@ -380,6 +388,12 @@
     ["debounce_ms",            "debounceMs",             "int",    5000,  "ms to wait after a TODO is created/edited before processing. Lets you keep typing."],
     ["auto_create_min_conf",   "autoCreateMinConfidence", "float", 0.7,   "AI must be at least this confident before auto-creating a new project page."],
     ["auto_create_daily_cap",  "autoCreateDailyCap",     "int",    5,     "Max new project pages auto-created per day. Resets at midnight."],
+    // v1.8.0: log housekeeping
+    ["log_retention_days",     "logRetentionDays",       "int",    30,    "Auto-prune Auto-Attribute TODO Log entries older than this many days. Set very high (e.g. 99999) to disable pruning."],
+    ["log_group_by_day",       "logGroupByDay",          "bool",   true,  "Nest each new log entry under a [[Month Dth, YYYY]] parent block. Keeps the log page collapsible by day instead of one flat list of hundreds of entries."],
+    // v1.8.0: block-ref following
+    ["follow_block_refs",      "followBlockRefs",        "bool",   true,  "When a TODO title contains ((uid)) block-refs, fetch the referenced blocks and feed their text + their own BT_attrProject into the LLM as a strong context signal. Catches 'do final pass on ((other-todo))' where the referenced block has the project."],
+    ["block_ref_max_follow",   "blockRefMaxFollow",      "int",    5,     "Max number of ((uid)) refs to resolve per TODO. Safety cap."],
   ];
 
   // === SETTINGS-PAGE LIB START v1.0.0 === (synced from _lib/settings-page.js)
@@ -605,6 +619,97 @@
     );
   }
 
+  /* v1.8.0: extract ((uid)) block-refs from text. Returns dedup'd list of
+   * 9-char-ish UIDs. Tolerates the (((uid))) typo by matching the inner pair.
+   * Filters out ((not-a-real-uid)) noise via the alphanumeric+_- charset. */
+  function extractBlockRefUids(text) {
+    if (!text || typeof text !== "string") return [];
+    const out = new Set();
+    // Match ((uid)) — 6+ chars of [A-Za-z0-9_-]. Roam UIDs are 9 chars but
+    // older blocks can be shorter; 6 is safe lower bound.
+    const re = /\(\(([A-Za-z0-9_-]{6,15})\)\)/g;
+    let m;
+    while ((m = re.exec(text)) !== null) out.add(m[1]);
+    return [...out];
+  }
+
+  /* v1.8.0: parse a BT_attrProject:: child block string into a project name.
+   * Handles BOTH dropdown ({{or: [[X]] | ...}}) and flat ([[X]]) syntax. */
+  function parseBTProjectFromString(s) {
+    if (!s) return null;
+    const m = s.match(/^BT_attrProject::\s*(?:\{\{or:\s*)?\[\[(.+?)\]\]/);
+    return m ? m[1] : null;
+  }
+
+  /* v1.8.0: resolve a block-ref UID to the rich context the LLM needs.
+   * Returns { uid, text, btProject, pageRefs: Set<string>, breadcrumb: string }
+   * or null if the block doesn't exist. Used for both prompt context AND
+   * graph-Jaccard ref-set expansion. */
+  function resolveReferencedBlock(uid) {
+    try {
+      const data = window.roamAlphaAPI.data.pull(
+        `[:block/string
+          :block/uid
+          {:block/children [:block/string]}
+          {:block/refs [:node/title]}
+          {:block/parents [:block/string]}]`,
+        [":block/uid", uid]
+      );
+      if (!data) return null;
+      const text = (data[":block/string"] || "").trim();
+      if (!text) return null;
+      let btProject = null;
+      for (const c of (data[":block/children"] || [])) {
+        const cs = c[":block/string"] || "";
+        if (cs.startsWith("BT_attrProject::")) {
+          btProject = parseBTProjectFromString(cs);
+          if (btProject) break;
+        }
+      }
+      const pageRefs = new Set();
+      for (const r of (data[":block/refs"] || [])) {
+        if (r[":node/title"]) pageRefs.add(r[":node/title"]);
+      }
+      const breadcrumb = (data[":block/parents"] || [])
+        .map(p => (p[":block/string"] || "").slice(0, 200))
+        .filter(Boolean)
+        .join(" > ");
+      return { uid, text, btProject, pageRefs, breadcrumb };
+    } catch (e) {
+      log("debug", `resolveReferencedBlock failed for ${uid}`, e?.message || e);
+      return null;
+    }
+  }
+
+  /* v1.8.0: collect ((uid)) refs from a TODO's text + breadcrumb, capped by
+   * blockRefMaxFollow. Returns array of resolved blocks (filters nulls).
+   * Used by attribute(), collectTodoContextRefs, buildTodoEmbedText. */
+  function collectReferencedBlocks(todoUid, todoText) {
+    if (!state.settings.followBlockRefs) return [];
+    let candidateUids = extractBlockRefUids(todoText);
+    // Also pull ((uid)) refs from the breadcrumb — sometimes the TODO is
+    // nested under a block that itself references a project block.
+    try {
+      const parents = window.roamAlphaAPI.data.pull(
+        "[{:block/parents [:block/string]}]",
+        [":block/uid", todoUid]
+      )?.[":block/parents"] || [];
+      for (const p of parents) {
+        const refs = extractBlockRefUids(p[":block/string"] || "");
+        for (const r of refs) {
+          if (!candidateUids.includes(r)) candidateUids.push(r);
+        }
+      }
+    } catch {}
+    // Drop the TODO's own UID if it matched (self-ref edge case)
+    candidateUids = candidateUids.filter(u => u !== todoUid);
+    const cap = state.settings.blockRefMaxFollow || 5;
+    return candidateUids
+      .slice(0, cap)
+      .map(resolveReferencedBlock)
+      .filter(Boolean);
+  }
+
   // v1.7.8: cheap defense layers run before the substring match.
   // Fenced-code and >5000-char blocks are never real TODOs; rejecting
   // here saves the page-title pull and any LLM call downstream.
@@ -755,6 +860,17 @@
         for (const r of (p[":block/refs"] || [])) {
           if (r[":node/title"]) refs.add(r[":node/title"]);
         }
+      }
+      // v1.8.0: expand the ref set with page-refs from any ((uid)) block-refs
+      // in the TODO text or breadcrumb. Lets graph-Jaccard pre-rank pick up
+      // "TODO references a block belonging to project X".
+      const todoText = data?.[":block/string"] || "";
+      const referencedBlocks = collectReferencedBlocks(uid, todoText);
+      for (const rb of referencedBlocks) {
+        for (const t of rb.pageRefs) refs.add(t);
+        // If the referenced block has its own BT_attrProject, that project's
+        // page name is the strongest possible signal — add it.
+        if (rb.btProject) refs.add(rb.btProject);
       }
       return refs;
     } catch (e) {
@@ -1080,7 +1196,17 @@
         .filter(Boolean)
         .join(" > ");
     } catch {}
-    return breadcrumb ? `${breadcrumb}\n${text}` : text;
+    // v1.8.0: inline referenced block content so semantic embedding "sees"
+    // through ((uid)) refs. Without this, the embedder treats ((abc123)) as
+    // an opaque token.
+    const refBlocks = collectReferencedBlocks(uid, text);
+    let refText = "";
+    if (refBlocks.length) {
+      refText = "\n\nReferenced blocks:\n" + refBlocks
+        .map(rb => `- "${rb.text.slice(0, 200)}"${rb.btProject ? ` [project: ${rb.btProject}]` : ""}`)
+        .join("\n");
+    }
+    return (breadcrumb ? `${breadcrumb}\n${text}` : text) + refText;
   }
 
   async function rankProjectsByEmbeddings(todoUid, todoText, projects) {
@@ -1570,6 +1696,27 @@
     }
 
     const projectsDataRaw = getActiveProjectsWithAliases();
+    // v1.8.0: if the TODO references a block whose BT_attrProject points to
+    // a project page that isn't in the active list, inject it as a synthetic
+    // candidate so the LLM has it as a choice. The picker rule "always return
+    // the canonical name from the list" otherwise blocks it. Page must
+    // physically exist (we don't fabricate options).
+    const refBlocksForProjects = collectReferencedBlocks(uid, text);
+    if (refBlocksForProjects.length) {
+      const activeNames = new Set(projectsDataRaw.map(p => p.name));
+      for (const rb of refBlocksForProjects) {
+        if (!rb.btProject) continue;
+        if (activeNames.has(rb.btProject)) continue;
+        // Confirm the project page exists before adding as a candidate
+        const exists = window.roamAlphaAPI.q(
+          `[:find ?u . :where [?p :node/title "${rb.btProject.replaceAll('"', '\\"')}"] [?p :block/uid ?u]]`
+        );
+        if (!exists) continue;
+        projectsDataRaw.push({ name: rb.btProject, aliases: [], _viaBlockRef: true });
+        activeNames.add(rb.btProject);
+        log("info", `injected referenced project [[${rb.btProject}]] as candidate (not in Active list)`);
+      }
+    }
     // Phase 3: try semantic embedding ranker first; falls back to Phase 2 if
     // disabled, no key, or network/quota error.
     const embedRanked = await rankProjectsByEmbeddings(uid, text, projectsDataRaw);
@@ -1588,13 +1735,21 @@
     const topK = rankerUsed === "embedding"
       ? Math.min(state.settings.embeddingTopK, projectsRanked.length)
       : Math.min(state.settings.graphJaccardTopK, projectsRanked.length);
-    const projectsData = projectsRanked.slice(0, topK);
+    let projectsData = projectsRanked.slice(0, topK);
+    // v1.8.0: ensure any block-ref-injected project is in the top-K window
+    // even if its similarity scores are zero — without this, the candidate
+    // we just injected can be sliced off below the cap.
+    const refInjected = projectsRanked.filter(p => p._viaBlockRef);
+    for (const ri of refInjected) {
+      if (!projectsData.some(p => p.name === ri.name)) projectsData.push(ri);
+    }
     const projectListLines = projectsData.map(p => {
       const parts = [];
       if (typeof p.embedScore === "number" && p.embedScore > 0) {
         parts.push(`semantic: ${p.embedScore.toFixed(2)}`);
       }
       if (p.graphScore > 0) parts.push(`graph: ${p.graphScore.toFixed(2)}`);
+      if (p._viaBlockRef) parts.push("via block-ref");
       const scoreNote = parts.length ? ` [${parts.join(", ")}]` : "";
       return p.aliases.length
         ? `- "${p.name}" (aliases: ${p.aliases.join(", ")})${scoreNote}`
@@ -1606,6 +1761,28 @@
     const correctionsBlock = recentCorrections.length
       ? `\n\nLEARNED FROM PAST CORRECTIONS (you previously suggested a project, the user manually changed it — learn from these):\n${recentCorrections.join("\n")}\n`
       : "";
+
+    // v1.8.0: surface ((uid)) block-refs found in the TODO. Live AI's
+    // roamContext doesn't dereference inline ((uid)) — the LLM otherwise sees
+    // only the opaque token. Walking the refs ourselves and injecting the
+    // referenced text + their BT_attrProject is the strongest signal we can
+    // give the picker: "this TODO IS about that other block".
+    const referencedBlocks = collectReferencedBlocks(uid, text);
+    let referencedBlocksBlock = "";
+    if (referencedBlocks.length) {
+      const lines = referencedBlocks.map(rb => {
+        const cleanText = rb.text.replace(/\s+/g, " ").slice(0, 220);
+        const proj = rb.btProject ? ` → already attributed to project [[${rb.btProject}]]` : "";
+        const crumb = rb.breadcrumb ? ` (under: ${rb.breadcrumb.slice(0, 120)})` : "";
+        return `- ((${rb.uid})) "${cleanText}"${proj}${crumb}`;
+      }).join("\n");
+      referencedBlocksBlock = `\n\nREFERENCED BLOCKS (the TODO contains ((uid)) block-refs — these are the STRONGEST context signal: this TODO is explicitly about the referenced work):\n${lines}\n
+Rules for using referenced blocks:
+- If a referenced block has "already attributed to project [[X]]" AND [[X]] appears in the project candidate list above (with or without "via block-ref" tag), set "project" to [[X]] with high confidence (>= 0.85). The user is doing follow-up work on that same project. Block-ref-injected candidates are NOT lower priority — they were added because the user explicitly linked to a block in that project.
+- Inherit relevant entity tags (e.g. people via [[Canonical Name]]) from the referenced block when writing the notes field.
+- Pull dates ("today/tomorrow") from the OUTER TODO text, not the referenced block — the referenced block's deadline is its own.
+- Use the referenced block's text + breadcrumb to inform notes content even when no project transfer applies.\n`;
+    }
 
     // Entities = pages with Aliases::, EXCLUDING active projects (those are
     // already in the project list above). These are typically people, things,
@@ -1694,7 +1871,7 @@ Active projects (pre-ranked by graph-similarity to this TODO's context — proje
 ${projectListLines}
 
 Other entities with aliases (use to TAG in notes via [[Canonical Name]] — these are people, places, things, NOT projects):
-${entityListLines}${correctionsBlock}`;
+${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
 
     try {
       state.callsToday++;
@@ -1931,34 +2108,219 @@ ${entityListLines}${correctionsBlock}`;
     }
   }
 
-  /* ---------- Roam log ---------- */
+  /* ---------- Roam log ----------
+   * v1.8.0: entries are now grouped under one parent block per day to keep
+   * the log page browsable as it grows. Pruning removes day-parent blocks
+   * older than logRetentionDays. Old flat entries are pruned by parsing
+   * their leading [[Month Dth, YYYY]] prefix — the migrate-flat command
+   * also folds them into the new grouped format.
+   */
+  function ensureLogPage() {
+    let pageUid = window.roamAlphaAPI.q(
+      `[:find ?u . :where [?p :node/title "${LOG_PAGE}"] [?p :block/uid ?u]]`
+    );
+    return pageUid;
+  }
+
+  async function ensureLogPageCreated() {
+    let pageUid = ensureLogPage();
+    if (!pageUid) {
+      pageUid = window.roamAlphaAPI.util.generateUID();
+      await window.roamAlphaAPI.data.page.create({
+        page: { title: LOG_PAGE, uid: pageUid },
+      });
+    }
+    return pageUid;
+  }
+
+  /* Find or create today's day-parent block on the log page. Day-parent
+   * convention: block string == formatRoamDate(0) (which is "[[Month Dth,
+   * YYYY]]"). Returns the day-parent block UID. Walks the page's direct
+   * children (NOT transitive descendants — important: nested blocks inside
+   * legacy flat entries can also match the date string). */
+  async function getOrCreateLogDayParent(pageUid, dayString) {
+    try {
+      const data = window.roamAlphaAPI.data.pull(
+        "[{:block/children [:block/uid :block/string]}]",
+        [":block/uid", pageUid]
+      );
+      const children = data?.[":block/children"] || [];
+      for (const c of children) {
+        if ((c[":block/string"] || "") === dayString && c[":block/uid"]) {
+          return c[":block/uid"];
+        }
+      }
+    } catch (e) {
+      log("debug", "getOrCreateLogDayParent lookup failed", e?.message || e);
+    }
+    const newUid = window.roamAlphaAPI.util.generateUID();
+    await window.roamAlphaAPI.data.block.create({
+      location: { "parent-uid": pageUid, order: "last" },
+      block: { uid: newUid, string: dayString },
+    });
+    return newUid;
+  }
+
   async function logToRoam(uid, attrs, error) {
     try {
-      let pageUid = window.roamAlphaAPI.q(
-        `[:find ?u . :where [?p :node/title "${LOG_PAGE}"] [?p :block/uid ?u]]`
-      );
-      if (!pageUid) {
-        pageUid = window.roamAlphaAPI.util.generateUID();
-        await window.roamAlphaAPI.data.page.create({
-          page: { title: LOG_PAGE, uid: pageUid },
-        });
-      }
+      const pageUid = await ensureLogPageCreated();
       const ts = new Date().toISOString().slice(11, 19);
       // ((uid)) block-ref so log entries are CLICKABLE — jump back to the
-      // source TODO with one click. Each TODO accrues one backlink per day
-      // (bounded by processedToday cache + once-per-day attempt). Project
-      // name as [[link]] so the log shows up on the project page too.
+      // source TODO with one click.
       const projectStr = attrs?.project ? `[[${attrs.project}]]` : "no-project";
       const summary = error
         ? `${ts} FAIL ((${uid})): ${error}`
         : `${ts} OK ((${uid})) → ${projectStr} / ${attrs.priority || "?"} / conf ${(attrs.confidence ?? 0).toFixed(2)}`;
-      await window.roamAlphaAPI.data.block.create({
-        location: { "parent-uid": pageUid, order: "last" },
-        block: { string: `${formatRoamDate(0)} ${summary}` },
-      });
+      const dayString = formatRoamDate(0);
+      // v1.8.0: group under per-day parent if enabled. Falls back to flat
+      // (legacy) format if disabled — entries still pruneable since they
+      // start with the date.
+      if (state.settings.logGroupByDay) {
+        const dayParentUid = await getOrCreateLogDayParent(pageUid, dayString);
+        await window.roamAlphaAPI.data.block.create({
+          location: { "parent-uid": dayParentUid, order: "last" },
+          block: { string: summary },
+        });
+      } else {
+        await window.roamAlphaAPI.data.block.create({
+          location: { "parent-uid": pageUid, order: "last" },
+          block: { string: `${dayString} ${summary}` },
+        });
+      }
+      // Opportunistic prune — only runs once per session-day.
+      maybePruneLog().catch(e => log("debug", "log-prune skipped", e?.message || e));
     } catch (e) {
       log("warn", "log-to-roam failed", e);
     }
+  }
+
+  /* Parse "[[Month Dth, YYYY]]" or "Month Dth, YYYY" prefix into a Date.
+   * Returns null if not parseable. */
+  function parseLogEntryDate(s) {
+    if (!s) return null;
+    const m = s.match(/^\[\[([A-Za-z]+ \d{1,2})(st|nd|rd|th), (\d{4})\]\]/) ||
+              s.match(/^([A-Za-z]+ \d{1,2})(st|nd|rd|th), (\d{4})/);
+    if (!m) return null;
+    const dateStr = `${m[1]}, ${m[3]}`;
+    const d = new Date(dateStr);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  /* v1.8.0: prune top-level log blocks (day-parents OR legacy flat entries)
+   * older than logRetentionDays. Also deletes orphaned non-date children of
+   * the log page that have no matching prefix (other than the page header). */
+  async function pruneLogPage() {
+    const pageUid = ensureLogPage();
+    if (!pageUid) return { kept: 0, pruned: 0 };
+    const retentionDays = state.settings.logRetentionDays || 30;
+    const cutoff = new Date();
+    cutoff.setHours(0, 0, 0, 0);
+    cutoff.setDate(cutoff.getDate() - retentionDays);
+    let pruned = 0;
+    let kept = 0;
+    let skippedNonDate = 0;
+    try {
+      const data = window.roamAlphaAPI.data.pull(
+        "[{:block/children [:block/uid :block/string :block/order]}]",
+        [":block/uid", pageUid]
+      );
+      const children = (data?.[":block/children"] || [])
+        .slice()
+        .sort((a, b) => (a[":block/order"] || 0) - (b[":block/order"] || 0));
+      for (const c of children) {
+        const cs = c[":block/string"] || "";
+        const cu = c[":block/uid"];
+        if (!cu) continue;
+        const d = parseLogEntryDate(cs);
+        if (!d) {
+          skippedNonDate++;
+          continue;
+        }
+        if (d < cutoff) {
+          try {
+            await window.roamAlphaAPI.data.block.delete({ block: { uid: cu } });
+            pruned++;
+          } catch (e) {
+            log("debug", `prune delete failed ${cu}`, e?.message || e);
+          }
+        } else {
+          kept++;
+        }
+      }
+      log("info", `log prune: ${pruned} pruned, ${kept} kept (>${retentionDays}d), ${skippedNonDate} non-date blocks left alone`);
+    } catch (e) {
+      log("warn", "pruneLogPage failed", e);
+    }
+    state.lastLogPruneAt = Date.now();
+    return { kept, pruned };
+  }
+
+  async function maybePruneLog() {
+    const interval = state.settings.logPruneIntervalMs || (24 * 60 * 60_000);
+    if (state.lastLogPruneAt && Date.now() - state.lastLogPruneAt < interval) return;
+    await pruneLogPage();
+  }
+
+  /* v1.8.0: one-shot migration — fold flat top-level log entries into per-day
+   * parent groups. Idempotent: re-running collapses any new flat entries
+   * without touching already-grouped ones. */
+  async function migrateFlatLogToGrouped() {
+    const pageUid = ensureLogPage();
+    if (!pageUid) return { moved: 0 };
+    let moved = 0;
+    let alreadyGrouped = 0;
+    const dayParentCache = new Map(); // dayString → uid
+    try {
+      const data = window.roamAlphaAPI.data.pull(
+        "[{:block/children [:block/uid :block/string :block/order {:block/children [:db/id]}]}]",
+        [":block/uid", pageUid]
+      );
+      const children = (data?.[":block/children"] || [])
+        .slice()
+        .sort((a, b) => (a[":block/order"] || 0) - (b[":block/order"] || 0));
+      for (const c of children) {
+        const cs = c[":block/string"] || "";
+        const cu = c[":block/uid"];
+        if (!cu) continue;
+        // Skip blocks that are themselves day-parents (string is exactly a date)
+        const isDayParent = /^\[\[[A-Za-z]+ \d{1,2}(st|nd|rd|th), \d{4}\]\]$/.test(cs);
+        if (isDayParent) {
+          alreadyGrouped++;
+          continue;
+        }
+        // Skip blocks that already have children (likely day-parents in the
+        // older un-bracketed format, or other structured blocks — leave alone).
+        if ((c[":block/children"] || []).length > 0) continue;
+        // Parse leading date and the rest of the entry
+        const m = cs.match(/^(\[\[[A-Za-z]+ \d{1,2}(?:st|nd|rd|th), \d{4}\]\])\s+(.*)$/);
+        if (!m) continue; // Not a flat log entry — leave alone
+        const dayString = m[1];
+        const restString = m[2];
+        let dayParentUid = dayParentCache.get(dayString);
+        if (!dayParentUid) {
+          dayParentUid = await getOrCreateLogDayParent(pageUid, dayString);
+          dayParentCache.set(dayString, dayParentUid);
+        }
+        try {
+          // Move the flat block under the day-parent and rewrite its string
+          // to drop the now-redundant date prefix.
+          await window.roamAlphaAPI.data.block.move({
+            location: { "parent-uid": dayParentUid, order: "last" },
+            block: { uid: cu },
+          });
+          await window.roamAlphaAPI.data.block.update({
+            block: { uid: cu, string: restString },
+          });
+          moved++;
+        } catch (e) {
+          log("debug", `migrate move failed ${cu}`, e?.message || e);
+        }
+      }
+    } catch (e) {
+      log("warn", "migrateFlatLogToGrouped failed", e);
+    }
+    log("info", `log migrate: ${moved} flat entries grouped, ${alreadyGrouped} day-parents already in place`);
+    return { moved, alreadyGrouped };
   }
 
   /* ---------- core processor ---------- */
@@ -2044,6 +2406,8 @@ ${entityListLines}${correctionsBlock}`;
       loadAllSettingsFromGraph();
       // Phase 3: refresh stale embeddings + GC removed projects every cycle
       refreshEmbeddingsIfStale().catch(e => log("warn", "embed refresh failed", e?.message || e));
+      // v1.8.0: prune log page once per day per session
+      maybePruneLog().catch(e => log("debug", "scan-prune skipped", e?.message || e));
       const uids = findAllTodos();
       let queued = 0;
       const budget = state.settings.scanBudgetPerCycle;
@@ -2483,6 +2847,12 @@ ${entityListLines}${correctionsBlock}`;
         `  ${onOff(state.settings.useEmbeddings)} embeddings (Phase 3 semantic ranker)`,
         `  ${onOff(state.settings.requireConfirmation)} suggestion-only mode`,
         `  ${onOff(state.settings.syncHubOnScan)} sync [[Active Projects]] hub on scan`,
+        `  ${onOff(state.settings.logGroupByDay)} group log entries by day`,
+        `  ${onOff(state.settings.followBlockRefs)} follow ((uid)) block-refs in TODOs`,
+        ``,
+        `── log housekeeping ──`,
+        `  Retention: ${state.settings.logRetentionDays} days`,
+        `  Last prune: ${state.lastLogPruneAt ? new Date(state.lastLogPruneAt).toISOString().slice(0,16).replace("T"," ") : "never (this session)"}`,
         ``,
         `── runtime ──`,
         `  LLM calls today: ${state.callsToday} / ${state.settings.dailyCallCap}`,
@@ -2512,6 +2882,22 @@ ${entityListLines}${correctionsBlock}`;
       }
       log("info", `manual scan queued ${queued}/${budget} blocks`);
     });
+    add("Auto-Attribute: prune log page now (delete old entries)", async () => {
+      // Force run regardless of session-day cooldown
+      state.lastLogPruneAt = 0;
+      const result = await pruneLogPage();
+      try {
+        alert(`Auto-Attribute log prune complete\n\nPruned: ${result.pruned}\nKept: ${result.kept}\nRetention: ${state.settings.logRetentionDays} days`);
+      } catch {}
+    });
+    add("Auto-Attribute: migrate flat log entries to per-day groups (one-shot)", async () => {
+      const result = await migrateFlatLogToGrouped();
+      try {
+        alert(`Auto-Attribute log migrate complete\n\nMoved into day groups: ${result.moved}\nDay-parents already in place: ${result.alreadyGrouped}`);
+      } catch {}
+    });
+    add("Auto-Attribute: toggle log grouping by day", toggleSetting("log_group_by_day", "logGroupByDay", "logGroupByDay"));
+    add("Auto-Attribute: toggle follow ((uid)) block-refs in TODOs", toggleSetting("follow_block_refs", "followBlockRefs", "followBlockRefs"));
     add("Auto-Attribute: emergency stop (cleanup + disable)", () => {
       state.settings.enabled = false;
       try { cleanup(); } catch (e) { log("warn", "cleanup err", e); }

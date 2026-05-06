@@ -67,6 +67,19 @@ All settings live as inline-editable blocks on a dedicated page:
     - AI must be at least this confident before auto-creating a new project page.
   - auto_create_daily_cap:: 5
     - Max new project pages auto-created per day.
+  - log_retention_days:: 30
+    - Auto-prune `[[Auto-Attribute TODO Log]]` entries older than this many days.
+      Set very high (e.g. 99999) to disable pruning.
+  - log_group_by_day:: true
+    - Nest each new log entry under a `[[Month Dth, YYYY]]` parent block.
+      Keeps the log page collapsible by day instead of one flat list.
+  - follow_block_refs:: true
+    - When a TODO title contains `((uid))` block-refs, fetch the referenced
+      block + its `BT_attrProject` and feed both into the LLM as the strongest
+      possible context signal. Catches "do final pass on `((other-todo))`"
+      where the referenced block already has the project assigned.
+  - block_ref_max_follow:: 5
+    - Safety cap on number of `((uid))` refs resolved per TODO.
 ```
 
 **To check current state of any toggle**: open the page, look at the value. That's the live state.
@@ -116,6 +129,10 @@ These flip a value in memory AND write back to the graph page, so the page alway
 | **dedupe BT_attr children (cleanup duplicates)** | Scan all TODOs, delete duplicate `BT_attrX::` children, keep first |
 | **rebuild all embeddings (force refresh)** | Re-embed every active project. Run after changing `embedding_model` |
 | **clear processedToday cache (allow re-process)** | Re-run attribution on every TODO touched today |
+| **prune log page now (delete old entries)** | Delete `[[Auto-Attribute TODO Log]]` entries older than `log_retention_days`. Runs once/day automatically; this command forces it. |
+| **migrate flat log entries to per-day groups** | One-shot reorganization of legacy flat entries into `[[Month Dth, YYYY]]` parent blocks. Idempotent. |
+| **toggle log grouping by day** | `log_group_by_day` |
+| **toggle follow ((uid)) block-refs in TODOs** | `follow_block_refs` |
 | **emergency stop (cleanup + disable)** | Kill all timers/watchers/cmds. Reload to restart. |
 
 ### Debug
@@ -189,6 +206,10 @@ When you change a `BT_attrProject` value (via Universal Selector dropdown or man
 
 ## Version history
 
+- **v1.8.0** — Log future-proofing + block-ref following.
+  - **Log housekeeping**: new entries nest under per-day parent blocks (`[[Month Dth, YYYY]]`), keeping the page collapsible. Auto-prune removes top-level day-parents (and any legacy flat entries) older than `log_retention_days` (default 30) once per session-day. New cmd palette: `prune log page now`, `migrate flat log entries to per-day groups`.
+  - **Block-ref following**: when a TODO title contains `((uid))` refs, the script resolves each referenced block, surfaces its text + breadcrumb in the LLM prompt, expands the graph-Jaccard ref-set with the referenced block's page-refs, and treats the referenced block's own `BT_attrProject` as the strongest possible signal ("this TODO is follow-up work on that other block — same project"). Catches the previously-missed pattern "do final pass on `((some-other-todo))`".
+- **v1.7.10** — `clean_todo_text` default OFF — LLM was stripping `(parens)` content + `#tags` once `BT_attrNotes`/`Project` captured them, mutating titles silently.
 - **v1.7.4** — Unified `[[Auto-Attribute Settings]]` page; toggles persist to graph; show-stats panel.
 - **v1.7.3** — Ghost cmd palette cleanup on init; insertAttrs dedup + race-window recheck; `discoverEmbeddingModels()` for self-healing.
 - **v1.7.2** — Gemini embedding model rotation (default → `gemini-embedding-001`, fallback chain).
