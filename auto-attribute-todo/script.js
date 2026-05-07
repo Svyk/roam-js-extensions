@@ -1,4 +1,25 @@
-/* auto-attribute-todo v1.7.10
+/* auto-attribute-todo v1.8.1
+ *
+ * v1.8.1 — Page-context project adoption + verified existing dedup.
+ *   When a TODO is created on a page that itself has `Project Status:: Active`
+ *   (or `Ongoing`), the plugin now adopts that page as BT_attrProject without
+ *   calling the LLM. Deterministic user signal: writing a TODO ON a project
+ *   page IS the project assignment. Falls through to existing LLM flow only
+ *   when the page is not project-tagged (or is `Project Status:: Archive`).
+ *   Handles both the literal form (`Project Status:: Active`) and the
+ *   Universal Selector dropdown form (`Project Status:: {{or: Active | ...}}`)
+ *   — the dropdown was the real-world failure case (page `[[filler idle
+ *   validation]]` 2026-05-07: TODO got `[[@1:1/Lori Boyd]]` from LLM instead
+ *   of inheriting the page). Excludes daily pages, roam/* pages, the
+ *   Active Projects hub, the log page, the settings page, and the
+ *   corrections page from the adoption check. New setting
+ *   `adopt_active_project_page:: true` (default ON; toggle off to revert
+ *   to pure LLM flow). Skips the periodic-scan auto-attribution path too —
+ *   if the TODO is on an active page, it's adopted at first sight, not
+ *   just on first edit. Side effect: when the page-context path fires,
+ *   the LLM call is skipped entirely so priority/energy/context/notes
+ *   stay empty until the user fills them or invokes "process focused
+ *   TODO now" via cmd palette to do an LLM completion of the rest.
  *
  * v1.7.10 — Default cleanTodoText to false. The LLM stage of the cleanup
  *   was reading user-typed parenthetical content `(...)` and `#tag`s as
@@ -394,6 +415,8 @@
     // v1.8.0: block-ref following
     ["follow_block_refs",      "followBlockRefs",        "bool",   true,  "When a TODO title contains ((uid)) block-refs, fetch the referenced blocks and feed their text + their own BT_attrProject into the LLM as a strong context signal. Catches 'do final pass on ((other-todo))' where the referenced block has the project."],
     ["block_ref_max_follow",   "blockRefMaxFollow",      "int",    5,     "Max number of ((uid)) refs to resolve per TODO. Safety cap."],
+    // v1.8.1: page-context project adoption
+    ["adopt_active_project_page", "adoptActiveProjectPage", "bool", true, "When the TODO is on a page that itself has 'Project Status:: Active' (or 'Ongoing'), adopt that page as BT_attrProject without calling the LLM. Skips daily pages, roam/* system pages, the hub/log/settings/corrections pages, and pages with Project Status:: Archive. Off = pure LLM flow regardless of page context."],
   ];
 
   // === SETTINGS-PAGE LIB START v1.0.0 === (synced from _lib/settings-page.js)
@@ -777,6 +800,57 @@
       if (contextPages.includes(pageTitle)) return `context page "${pageTitle}"`;
     }
     if (looksLikeCodeBlock(text)) return "fenced code block";
+    return null;
+  }
+
+  /* v1.8.1: page-context project adoption.
+   * Returns the page title if the TODO is on a page whose own
+   * `Project Status::` block resolves to Active or Ongoing, null otherwise.
+   * Handles both literal `Project Status:: Active` and the Universal
+   * Selector dropdown form `Project Status:: {{or: Active | +attr:[[Project Status]]}}`
+   * — the dropdown was the failure case discovered 2026-05-07 with page
+   * `[[filler idle validation]]`. Excludes daily pages, system pages
+   * (roam/*, hub, etc.), and the plugin's own pages from adoption. */
+  function findActiveProjectAncestor(uid) {
+    const pageTitle = getBlockPageTitle(uid);
+    if (!pageTitle) return null;
+    if (isDailyPageTitle(pageTitle)) return null;
+    if (isSystemPageTitle(pageTitle)) return null;
+    if (pageTitle === LOG_PAGE) return null;
+    if (pageTitle === SETTINGS_PAGE) return null;
+    if (pageTitle === state.settings.correctionsPage) return null;
+
+    const activeStatuses = (state.settings.activeProjectStatuses || ["Active", "Ongoing"])
+      .map(s => s.toLowerCase());
+
+    try {
+      const safeName = pageTitle.replaceAll('"', '\\"');
+      const rows = window.roamAlphaAPI.data.q(`
+        [:find ?s
+         :where
+         [?p :node/title "${safeName}"]
+         [?b :block/page ?p]
+         [?b :block/string ?s]
+         [(clojure.string/starts-with? ?s "Project Status::")]]
+      `);
+      if (!rows || rows.length === 0) return null;
+      for (const row of rows) {
+        const s = row[0] || "";
+        const m = s.match(/^Project Status::\s*(.+)$/);
+        if (!m) continue;
+        let value = m[1].trim();
+        // Universal Selector dropdown form: {{or: Active | +attr:...}} →
+        // grab the FIRST option (currently selected value).
+        const dropdown = value.match(/^\{\{or:\s*([^|}]+)/);
+        if (dropdown) value = dropdown[1].trim();
+        // Strip [[...]] wrap if the status is a page link.
+        value = value.replace(/^\[\[(.+)\]\]$/, "$1").trim().toLowerCase();
+        if (value === "archive" || value === "archived") return null;
+        if (activeStatuses.includes(value)) return pageTitle;
+      }
+    } catch (e) {
+      log("debug", `findActiveProjectAncestor failed for ${pageTitle}`, e);
+    }
     return null;
   }
 
@@ -2352,6 +2426,32 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     // (which removes the uid from processedToday before re-processing).
     state.processedToday.add(uid);
     persistProcessed();
+
+    // v1.8.1: page-context project adoption — short-circuit BEFORE LLM call.
+    // If the TODO is on a page whose own Project Status:: is Active/Ongoing,
+    // adopt that page directly and skip the LLM. Deterministic user signal:
+    // writing a TODO on a project page IS the project assignment.
+    if (state.settings.adoptActiveProjectPage) {
+      const pageProject = findActiveProjectAncestor(uid);
+      if (pageProject) {
+        log("info", `[${uid}] page-context adoption → [[${pageProject}]] (no LLM call)`);
+        const adoptedAttrs = {
+          project: pageProject,
+          top_3_projects: [pageProject],
+          confidence: 1.0,
+          notes: "page-context adopted",
+          source: "page-context",
+        };
+        try {
+          await insertAttrs(uid, adoptedAttrs, text);
+          await logToRoam(uid, adoptedAttrs, null);
+        } catch (e) {
+          log("error", `[${uid}] page-context insert failed`, e);
+          await logToRoam(uid, adoptedAttrs, e.message);
+        }
+        return;
+      }
+    }
 
     const attrs = await attribute(uid, text);
     if (!attrs) {

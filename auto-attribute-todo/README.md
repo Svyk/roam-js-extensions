@@ -206,6 +206,12 @@ When you change a `BT_attrProject` value (via Universal Selector dropdown or man
 
 ## Version history
 
+- **v1.8.1** — Page-context project adoption.
+  - When a TODO is created on a page that itself has `Project Status:: Active` (or `Ongoing`), the plugin adopts that page as `BT_attrProject` **without calling the LLM**. Deterministic user signal: writing a TODO on a project page IS the project assignment.
+  - Handles both literal form (`Project Status:: Active`) and Universal Selector dropdown form (`Project Status:: {{or: Active | +attr:[[Project Status]]}}`). The dropdown form was the real-world failure case — discovered 2026-05-07 with page `[[filler idle validation]]` where a TODO mentioning Lori got `[[@1:1/Lori Boyd]]` from the LLM instead of inheriting the page.
+  - Excludes daily pages, `roam/*` system pages, the Active Projects hub, the log page, the settings page, and the corrections page from the adoption check. Pages with `Project Status:: Archive` fall through to the LLM as before.
+  - New setting: `adopt_active_project_page:: true` (default ON). Toggle off to revert to pure LLM flow regardless of page context.
+  - Side effect: when the page-context path fires, the LLM call is skipped entirely, so `BT_attrPriority`, `BT_attrEnergy`, `BT_attrContext`, `BT_attrNotes` stay empty. Use `Auto-Attribute: process focused TODO now` from the cmd palette if you want the LLM to fill the rest.
 - **v1.8.0** — Log future-proofing + block-ref following.
   - **Log housekeeping**: new entries nest under per-day parent blocks (`[[Month Dth, YYYY]]`), keeping the page collapsible. Auto-prune removes top-level day-parents (and any legacy flat entries) older than `log_retention_days` (default 30) once per session-day. New cmd palette: `prune log page now`, `migrate flat log entries to per-day groups`.
   - **Block-ref following**: when a TODO title contains `((uid))` refs, the script resolves each referenced block, surfaces its text + breadcrumb in the LLM prompt, expands the graph-Jaccard ref-set with the referenced block's page-refs, and treats the referenced block's own `BT_attrProject` as the strongest possible signal ("this TODO is follow-up work on that other block — same project"). Catches the previously-missed pattern "do final pass on `((some-other-todo))`".
