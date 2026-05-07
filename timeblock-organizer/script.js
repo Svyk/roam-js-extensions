@@ -1,4 +1,36 @@
-/* timeblock-organizer v1.1.3
+/* timeblock-organizer v1.1.4
+ *
+ * v1.1.4 — Three improvements driven by 2026-05-06 use:
+ *   (a) `#concurrent` opt-out for intentional overlaps. The Phase 2 conflict
+ *       detector flagged every overlapping pair, but sometimes Svyat is
+ *       working on two things at once (long meeting + flexible Plodding
+ *       task running in parallel) and the `**TimeBlock Conflicts**` status
+ *       block is just noise. New `concurrentMarker` setting (default
+ *       `#concurrent`) — if EITHER block in an overlapping pair contains
+ *       the marker, the pair is skipped in `detectOverlaps`. The
+ *       `#pinned-time` mechanism (which only blocks auto-bumping) is
+ *       unchanged — `#concurrent` is a separate, narrower opt-out that
+ *       suppresses the warning entirely.
+ *   (b) Loose-sort fallback for incomplete time entries. The strict
+ *       parseTimePrefix has three regexes (range, TODO-prefixed, single
+ *       timestamp), all requiring `\s+(?=\S)` after the time — so entries
+ *       like bare `19:00 ` (just the time, no description yet) or
+ *       `{{[[TODO]]}} 19:00 thing` (time mid-text after a tool marker)
+ *       fall through to "untimed" and historically got parked at the top
+ *       of the TimeBlock as `tbOther`. New `looseParseTimePrefix` scans
+ *       the first 30 chars for any HH:MM and returns it as a sort hint
+ *       only — never used to rewrite the block. Default ON via
+ *       `looseSortFallback`. Entries that even loose-parsing can't time
+ *       still bucket to "untimed".
+ *   (c) Untimed entries park at BOTTOM, not top. Before v1.1.4 anything
+ *       that didn't parse as time-prefixed was placed at the start of the
+ *       TimeBlock (the design intent was "park unsorted stuff visible at
+ *       the top"), but practically it pushed every real time-entry down a
+ *       row and made the day's chronology start at item 2+. Default
+ *       `untimedAtBottom: true` flips it: incomplete drafts drift to the
+ *       end where they're easy to finish, real entries lead the timeline.
+ *       Set `untimedAtBottom:: false` on the settings page to restore the
+ *       legacy ordering.
  *
  * v1.1.3 — Two parser fixes that left entries stuck out of order at the
  *   top of TimeBlock children, surfaced by a 2026-05-02 reconcile of
@@ -76,7 +108,7 @@
  * No LLM call. Pure Roam datalog + block.move/update. Cost: $0.
  */
 ;(function () {
-  const VERSION = "1.1.3";
+  const VERSION = "1.1.4";
   const NAMESPACE = "timeblock-organizer";
   const SETTINGS_PAGE = "TimeBlock Organizer Settings";
 
@@ -100,6 +132,10 @@
     conflictStrategy: "bump_forward",      // only one strategy supported for now
     cascadeCutoffTime: "23:00",            // refuse to bump past this (HH:MM)
     pinnedMarker: "#pinned-time",          // items with this tag don't get bumped
+    // v1.1.4
+    concurrentMarker: "#concurrent",       // overlap pair where EITHER block has this tag is intentional — skip the conflict warning
+    looseSortFallback: true,               // when strict regex fails, scan first 30 chars for HH:MM and sort by that anyway (catches in-progress edits like "19:00 " or "{{[[TODO]]}} 19:00 thing"); never rewrites the block
+    untimedAtBottom: true,                 // when an entry can't be timed even loosely, park it at the BOTTOM of the TimeBlock (not the top — that was the surprise)
   };
 
   const state = {
@@ -157,6 +193,13 @@
       "If a cascade would push an item to start past this time (HH:MM, 24h), refuse the resolution and flag the item as a dead-end in the status block. Default 23:00 (no scheduling past 11pm)."],
     ["pinned_marker",               "pinnedMarker",              "string", "#pinned-time",
       "Substring/tag that marks an item as user-pinned. Pinned items are NEVER auto-bumped, even if they're the cause of a cascade dead-end. Add this tag to a TODO to lock its time."],
+    // v1.1.4 ──────────────────────────────────────────────────────────────────
+    ["concurrent_marker",           "concurrentMarker",          "string", "#concurrent",
+      "Substring/tag for blocks that may legitimately overlap. If EITHER block in an overlapping pair contains this tag, the pair is treated as intentional concurrent work and is NOT flagged in the **TimeBlock Conflicts** status block. Use when you're working on two things at once (e.g. a long meeting that runs in parallel with a flexible Plodding task)."],
+    ["loose_sort_fallback",         "looseSortFallback",         "bool",   true,
+      "When strict regex fails (incomplete entries like '19:00 ' with nothing after, or '{{[[TODO]]}} 19:00 thing' with the time mid-text), scan the first 30 chars for any HH:MM and sort the block by that time anyway. Never rewrites the block — sort-only. Off = old strict behavior where any non-strict block lands in the bucketed group."],
+    ["untimed_at_bottom",           "untimedAtBottom",           "bool",   true,
+      "Park entries that can't be timed (even with loose-sort fallback) at the BOTTOM of the TimeBlock rather than the top. False = legacy behavior (untimed at top). Bottom is less surprising — incomplete entries drift to the end where you can finish them."],
   ];
 
   // === SETTINGS-PAGE LIB START v1.0.0 === (synced from _lib/settings-page.js)
@@ -458,6 +501,36 @@
     return parseTimePrefix(s) !== null;
   }
 
+  /* v1.1.4 — loose sort fallback. When parseTimePrefix returns null (the
+   * three strict regexes don't match), scan the first 30 chars for any
+   * HH:MM and return its startMin so the block can still sort by intended
+   * time. Catches in-progress entries: bare "19:00" with no description
+   * yet, "{{[[TODO]]}} 19:00 thing" with the time mid-text after a tool
+   * marker, or "[[some link]] 19:00 description" with leading content.
+   * Never used to rewrite — pure sort hint. Returns null if no usable
+   * HH:MM is in the head. */
+  const LOOSE_TIME_RE = /\b(\d{1,2}):(\d{2})\b/;
+  function looseParseTimePrefix(s) {
+    if (!s || !state.settings.looseSortFallback) return null;
+    const head = s.slice(0, 30);
+    const m = head.match(LOOSE_TIME_RE);
+    if (!m) return null;
+    const h = parseInt(m[1], 10);
+    const mn = parseInt(m[2], 10);
+    if (h > 23 || mn > 59) return null;
+    return h * 60 + mn;
+  }
+
+  /* Combined sort hint: strict parse takes priority (preserves existing
+   * end-time-based sort tie-breaking by returning the full {startMin,
+   * endMin} structure indirectly via parseTimePrefix), and loose parse
+   * fills in for everything else. Used by the bucketing logic below. */
+  function sortHint(s) {
+    const strict = parseTimePrefix(s);
+    if (strict) return strict.startMin;
+    return looseParseTimePrefix(s);
+  }
+
   function isSmartBlockButton(s) {
     return s === state.settings.smartblockButtonSignature;
   }
@@ -508,6 +581,7 @@
    */
   function detectOverlaps(sortedItems) {
     const conflicts = [];
+    const concurrentMarker = state.settings.concurrentMarker;
     const parsed = sortedItems
       .map(it => ({ ...it, t: parseTimePrefix(it.string) }))
       .filter(it => it.t && it.t.endMin > it.t.startMin);
@@ -516,6 +590,13 @@
       for (let j = i + 1; j < parsed.length; j++) {
         const b = parsed[j];
         if (b.t.startMin >= a.t.endMin) break; // sorted; no further overlaps with a
+        // v1.1.4: opt-out — overlap pair where EITHER block carries the
+        // concurrent marker (default `#concurrent`) is intentional
+        // (working on two things at once); skip the conflict.
+        if (concurrentMarker && (
+          a.string.includes(concurrentMarker) ||
+          b.string.includes(concurrentMarker)
+        )) continue;
         const overlapStart = Math.max(a.t.startMin, b.t.startMin);
         const overlapEnd = Math.min(a.t.endMin, b.t.endMin);
         if (overlapEnd > overlapStart) {
@@ -699,23 +780,44 @@
       c.uid !== tbUid && isTimePrefixed(c.string)
     );
 
-    const tbTimePrefixed = tbChildren.filter(c => isTimePrefixed(c.string));
     const tbButtons = tbChildren.filter(c => isSmartBlockButton(c.string));
-    const tbOther = tbChildren.filter(c =>
-      !isTimePrefixed(c.string) && !isSmartBlockButton(c.string)
+
+    // v1.1.4 — three-way bucketing instead of two:
+    //   strictly-timed: parseTimePrefix returns a real {startMin, endMin}
+    //   loosely-timed:  strict fails BUT looseParseTimePrefix finds an HH:MM
+    //   untimed:        no usable time at all
+    // Strictly + loosely-timed merge into one chronologically-sorted
+    // sequence; untimed entries drop to the BOTTOM (config: untimedAtBottom)
+    // so they're easy to finish/triage rather than parked at the top.
+    const nonButtonChildren = tbChildren.filter(c => !isSmartBlockButton(c.string));
+    const tbStrictTimed = nonButtonChildren.filter(c => isTimePrefixed(c.string));
+    const tbLooseTimed = nonButtonChildren.filter(c =>
+      !isTimePrefixed(c.string) && looseParseTimePrefix(c.string) !== null
+    );
+    const tbUntimed = nonButtonChildren.filter(c =>
+      !isTimePrefixed(c.string) && looseParseTimePrefix(c.string) === null
     );
 
-    const allTodos = [...tbTimePrefixed, ...pageLevelMisplaced];
-    allTodos.sort((a, b) => {
-      const at = parseTimePrefix(a.string).startMin;
-      const bt = parseTimePrefix(b.string).startMin;
-      return at - bt;
-    });
+    // pageLevelMisplaced is already filtered to isTimePrefixed-only by line
+    // 698-700, so it's all strict — merge into the timed group.
+    const allTimed = [
+      ...tbStrictTimed.map(c => ({ c, sort: parseTimePrefix(c.string).startMin })),
+      ...tbLooseTimed.map(c => ({ c, sort: looseParseTimePrefix(c.string) })),
+      ...pageLevelMisplaced.map(c => ({ c, sort: parseTimePrefix(c.string).startMin })),
+    ];
+    allTimed.sort((a, b) => a.sort - b.sort);
+    const allTodos = allTimed.map(x => x.c);
 
-    // Final desired sequence: tbOther (untouched, in their existing order),
-    // then sorted TODOs, then SmartBlock button(s).
+    // Final desired sequence — depends on `untimedAtBottom`:
+    //   true (default since v1.1.4): timed entries first, untimed at bottom,
+    //                                SmartBlock button last
+    //   false (legacy):              untimed first, timed sorted, button last
+    const desired = state.settings.untimedAtBottom
+      ? [...allTodos, ...tbUntimed, ...tbButtons]
+      : [...tbUntimed, ...allTodos, ...tbButtons];
+
     return {
-      desired: [...tbOther, ...allTodos, ...tbButtons],
+      desired,
       pageLevelMisplaced,
       currentTbChildren: tbChildren,
     };
