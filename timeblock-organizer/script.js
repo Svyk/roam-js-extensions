@@ -1,4 +1,19 @@
-/* timeblock-organizer v1.1.4
+/* timeblock-organizer v1.1.5
+ *
+ * v1.1.5 — Hotfix: TimeBlock parent detection broken by Nautilus retirement
+ *   (Roam block ((bw1QibZxU)) on 2026-05-07). The default `timeblockSignature`
+ *   was the legacy Nautilus render prefix
+ *   (`"#TimeBlock {{[[roam/render]]:((roam-render-Nautilus-cljs))"`). After the
+ *   render component was retired, daily-page TimeBlock parents became plain
+ *   `#TimeBlock` blocks, which no longer matched the prefix → `findTimeBlockUid`
+ *   returned null → reconcile silently no-op'd, leaving entries unsorted.
+ *   Fix: `timeblockSignature` is now a TAG (`#TimeBlock` default), and
+ *   `findTimeBlockUid` matches `^<tag>(\s|$)` — accepts both legacy form
+ *   (with the render text after a space) AND the new plain form. Excludes
+ *   accidental matches like `#TimeBlocked`. Existing user settings on
+ *   [[TimeBlock Organizer Settings]] with the old long-prefix value need
+ *   to be edited to just `#TimeBlock` for the matcher to pick up the new
+ *   regex form (the user's settings-page value still wins over DEFAULTS).
  *
  * v1.1.4 — Three improvements driven by 2026-05-06 use:
  *   (a) `#concurrent` opt-out for intentional overlaps. The Phase 2 conflict
@@ -108,7 +123,7 @@
  * No LLM call. Pure Roam datalog + block.move/update. Cost: $0.
  */
 ;(function () {
-  const VERSION = "1.1.4";
+  const VERSION = "1.1.5";
   const NAMESPACE = "timeblock-organizer";
   const SETTINGS_PAGE = "TimeBlock Organizer Settings";
 
@@ -117,7 +132,7 @@
     debounceMs: 8000,                      // coalesce burst writes
     historicalWindowDays: 7,               // how far back to auto-watch on navigation
     maxActiveWatches: 14,                  // LRU cap
-    timeblockSignature: "#TimeBlock {{[[roam/render]]:((roam-render-Nautilus-cljs))",
+    timeblockSignature: "#TimeBlock",
     smartblockButtonSignature: "{{🕗↦:SmartBlock:Double timestamp buttons2}}",
     sweepIntervalMs: 5 * 60_000,           // periodic reconcile in case watches miss edits
     rolloverCheckMs: 60_000,               // how often to check for date rollover
@@ -166,7 +181,7 @@
     ["max_active_watches",          "maxActiveWatches",          "int",    14,
       "Cap on simultaneously-watched daily pages. LRU evicts when exceeded."],
     ["timeblock_signature",         "timeblockSignature",        "string", DEFAULTS.timeblockSignature,
-      "Prefix that identifies the Nautilus TimeBlock parent block. The plugin finds the FIRST block on a daily page whose string starts with this."],
+      "TAG that identifies the TimeBlock parent block on a daily page. Default `#TimeBlock`. v1.1.5+: matched as `^<tag>(\\s|$)` — block must START with the tag followed by whitespace or end-of-string. Permits both legacy form (`#TimeBlock {{[[roam/render]]:((roam-render-Nautilus-cljs))...}}`) and post-2026-05-07 plain `#TimeBlock`. Edit if you renamed the tag (e.g. `#tb`)."],
     ["smartblock_button_signature", "smartblockButtonSignature", "string", DEFAULTS.smartblockButtonSignature,
       "Exact string of the SmartBlock timestamp-button block that must always be the last child of TimeBlock. If you renamed it, paste the new exact string here."],
     ["sweep_interval_ms",           "sweepIntervalMs",           "int",    300000,
@@ -433,10 +448,22 @@
   }
 
   function findTimeBlockUid(dailyPageUid) {
+    // v1.1.5: signature is now a leading TAG (e.g. "#TimeBlock"), not a full
+    // prefix string. Match if the block starts with the tag followed by
+    // whitespace OR end-of-string. This catches:
+    //   - "#TimeBlock"                                              (post-2026-05-07, nautilus retired)
+    //   - "#TimeBlock {{[[roam/render]]:((roam-render-Nautilus-cljs)) ...}}"  (legacy, still works)
+    //   - "#TimeBlock #pinned-time"                                  (custom suffixes)
+    // and EXCLUDES "#TimeBlocked", "#TimeBlocking", etc.
     const sig = state.settings.timeblockSignature;
+    if (!sig) return null;
+    // Build regex from the tag — escape regex metacharacters in case the
+    // user configured a fancy signature.
+    const escSig = sig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp("^" + escSig + "(?:\\s|$)");
     const children = getDirectChildren(dailyPageUid);
     for (const c of children) {
-      if (c.string.startsWith(sig)) return c.uid;
+      if (re.test(c.string)) return c.uid;
     }
     return null;
   }
