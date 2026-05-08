@@ -1,4 +1,14 @@
-/* auto-attribute-todo v1.8.2
+/* auto-attribute-todo v1.8.3
+ *
+ * v1.8.3 — Scan interval compromise: 60min → 30min. The v1.8.2 quartering
+ *   was based on a misdiagnosis of the sync failure mode (assumed outbound
+ *   write pressure). 2026-05-07 evidence proved it was INBOUND apply lag
+ *   from nautilus' reactive reads — fixed by retiring nautilus, not by
+ *   throttling writes. 30 min keeps the lower-write benefit (vs. v1.8.0's
+ *   15) without making new TODOs wait up to an hour for attribution. The
+ *   pause-on-network-pressure + parallel BT_attr writes from v1.8.2 stay
+ *   — both are genuine improvements regardless of which side of sync was
+ *   the bottleneck.
  *
  * v1.8.2 — Network-pressure resilience for work-WiFi sync storms (Roam task
  *   ((SduPiN4v7))). Three changes addressing the residual queue saturation
@@ -319,7 +329,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.8.2";
+  const VERSION = "1.8.3";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -330,7 +340,7 @@
     minTextLength: 12,
     confidenceThreshold: 0.6,
     dailyCallCap: 100,
-    scanIntervalMs: 60 * 60_000,  // v1.8.1: 15 min → 60 min — work-network sync was getting saturated by 4×/hr scans triggering hub-sync + log-prune + setting-reload
+    scanIntervalMs: 30 * 60_000,  // v1.8.3: 60 min → 30 min compromise. v1.8.2 went 15→60 to reduce write pressure, but the actual sync failure mode turned out to be INBOUND apply lag (nautilus reactive reads, retired 2026-05-07), not outbound writes. 30 min keeps the lower-write benefit without delaying new-TODO attribution by up to an hour.
     scanBudgetPerCycle: 10,
     // v1.8.1 — pause-on-network-pressure: when the browser reports offline,
     // OR the user manually pauses (cmd palette), suppress all LLM calls,

@@ -15,10 +15,10 @@
     },
     {
       "name": "auto-attribute-todo",
-      "version": "1.8.2",
+      "version": "1.8.3",
       "namespace": "auto-attr-todo",
       "url": "https://raw.githubusercontent.com/Svyk/roam-js-extensions/main/auto-attribute-todo/script.js",
-      "description": "Auto-fills BT_attr* on new {{[[TODO]]}} blocks via LiveAI_API. Phase 3 semantic embeddings via Gemini. v1.8.0: log housekeeping (per-day grouping + auto-prune) + ((uid)) block-ref following. v1.8.1: page-context project adoption (TODO on a Project Status:: Active page inherits that project). v1.8.2: pause-on-network-pressure + 60min default scan + parallel BT_attr writes \u2014 work-WiFi sync resilience.",
+      "description": "Auto-fills BT_attr* on new {{[[TODO]]}} blocks via LiveAI_API. Phase 3 semantic embeddings via Gemini. v1.8.0: log housekeeping (per-day grouping + auto-prune) + ((uid)) block-ref following. v1.8.1: page-context project adoption (TODO on a Project Status:: Active page inherits that project). v1.8.2: pause-on-network-pressure + parallel BT_attr writes. v1.8.3: scan default 60min\u219230min after retiring nautilus (the actual sync bottleneck was inbound apply lag, not outbound writes).",
       "auto_runs": true,
       "daily_call_cap": 100,
       "settings_page": "Auto-Attribute Settings"
