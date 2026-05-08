@@ -1,4 +1,31 @@
-/* auto-attribute-todo v1.8.1
+/* auto-attribute-todo v1.8.2
+ *
+ * v1.8.2 — Network-pressure resilience for work-WiFi sync storms (Roam task
+ *   ((SduPiN4v7))). Three changes addressing the residual queue saturation
+ *   the user observed at the office even after disabling auto-attribute:
+ *   (a) Default scan interval 15min → 60min. Each scan cycle hub-syncs,
+ *       reloads settings, refreshes embeddings, and prunes the log — all
+ *       writes to Roam. Quartering the scan rate cuts the script's
+ *       background write contribution by 4× without losing functionality
+ *       (the pullwatch on the [[TODO]] page still catches new TODOs in
+ *       real time; scan is just the safety net for missed edits).
+ *   (b) Pause-on-network-pressure. Listens to `online`/`offline` browser
+ *       events. While offline, processBlock skips all work — no LLM
+ *       calls, no BT_attr writes, no scans. After the browser reports
+ *       back online, a 60s grace window (`pauseGraceMs`) lets Roam's own
+ *       sync queue drain BEFORE we add to it. Same pause mechanism
+ *       supports manual pause via cmd palette → "Auto-Attribute: pause
+ *       for 30 min (work-network mode)" — useful when you walk into the
+ *       office and know the work-WiFi will be flaky. Resume early via
+ *       "Auto-Attribute: resume now (clear manual pause)".
+ *   (c) Parallel BT_attr writes. insertAttrs used to await sequentially:
+ *       6 round-trips of stalled UI per TODO. Now Promise.all'd —
+ *       wall-clock cost drops from ~6×latency to ~1×latency. Roam owns
+ *       its own ordering via the explicit `order: i` we pass; concurrent
+ *       creates don't race each other on layout.
+ *   New settings: pauseGraceMs (60s), manualPauseDurationMs (30min).
+ *   show-stats panel adds a "pause status" section with current effective
+ *   state (network online/offline + manual pause expiry + scan interval).
  *
  * v1.8.1 — Page-context project adoption + verified existing dedup.
  *   When a TODO is created on a page that itself has `Project Status:: Active`
@@ -292,7 +319,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.8.0";
+  const VERSION = "1.8.2";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -303,8 +330,14 @@
     minTextLength: 12,
     confidenceThreshold: 0.6,
     dailyCallCap: 100,
-    scanIntervalMs: 15 * 60_000,
+    scanIntervalMs: 60 * 60_000,  // v1.8.1: 15 min → 60 min — work-network sync was getting saturated by 4×/hr scans triggering hub-sync + log-prune + setting-reload
     scanBudgetPerCycle: 10,
+    // v1.8.1 — pause-on-network-pressure: when the browser reports offline,
+    // OR the user manually pauses (cmd palette), suppress all LLM calls,
+    // scans, and BT_attr writes. Resume after `pauseGraceMs` of being back
+    // online (so the existing sync queue has time to drain before we add to it).
+    pauseGraceMs: 60_000,         // wait 60s after coming back online before resuming
+    manualPauseDurationMs: 30 * 60_000, // 30 min default for manual pause cmd
     contextPages: ["Time Block Constraints", "Chief of Staff/Memory"],
     requireConfirmation: false,
     aliasKeyword: "Aliases",
@@ -359,6 +392,12 @@
     projectEmbeddings: new Map(), // projectName → Float-array vector (in-mem cache)
     idbConn: null,                // cached IndexedDB connection
     embedsBootstrapped: false,
+    // ── v1.8.1 pause state ────────────────────────────────────────────────
+    networkOnline: true,          // mirrors navigator.onLine; flipped by online/offline events
+    networkOnlineSince: Date.now(), // when we last came online (for grace period)
+    manualPauseUntil: 0,          // ms timestamp; 0 = no manual pause
+    onlineHandler: null,          // bound listener for cleanup
+    offlineHandler: null,
   };
 
   /* ---------- helpers ---------- */
@@ -2127,15 +2166,21 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     });
     // Track block UIDs we create — specifically the BT_attrProject one
     // gets a correction-learning watcher.
+    // v1.8.1: parallelize via Promise.all instead of sequential await. Each
+    // create still hits Roam's data-API queue, but the wall-clock cost
+    // drops from ~6×latency to ~1×latency. Roam handles its own ordering
+    // via the explicit `order: i` we pass — concurrent writes don't race
+    // each other on layout. Net: 5 fewer round-trips of stalled UI when
+    // Roam's sync queue is already backed up at work.
     const createdUids = [];
-    for (let i = 0; i < blocksToCreate.length; i++) {
+    await Promise.all(blocksToCreate.map(async (str, i) => {
       const newUid = window.roamAlphaAPI.util.generateUID();
       await window.roamAlphaAPI.data.block.create({
         location: { "parent-uid": parentUid, order: i },
-        block: { uid: newUid, string: blocksToCreate[i] },
+        block: { uid: newUid, string: str },
       });
-      createdUids.push({ uid: newUid, str: blocksToCreate[i] });
-    }
+      createdUids.push({ uid: newUid, str });
+    }));
     if (blocksToCreate.length < blocks.length) {
       log("info", `[${parentUid}] inserted ${blocksToCreate.length}/${blocks.length} attrs (dedup skipped ${blocks.length - blocksToCreate.length})`);
     }
@@ -2397,10 +2442,70 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     return { moved, alreadyGrouped };
   }
 
+  /* ---------- v1.8.1: pause-on-network-pressure ----------
+   * Returns the reason this script should be paused, or null if it should run.
+   * Three pause sources:
+   *   - browser offline (navigator.onLine === false; tracked via online/offline events)
+   *   - browser came back online but we're inside the grace period (let Roam's
+   *     own queue drain before we add to it)
+   *   - manual pause via cmd palette (state.manualPauseUntil > now)
+   * Used by processBlock + startScan to skip work cleanly.
+   */
+  function pauseReason() {
+    if (state.manualPauseUntil > Date.now()) {
+      const minsLeft = Math.ceil((state.manualPauseUntil - Date.now()) / 60000);
+      return `manually paused (${minsLeft} min remaining)`;
+    }
+    if (!state.networkOnline) return "browser offline";
+    const sinceOnline = Date.now() - state.networkOnlineSince;
+    const grace = state.settings.pauseGraceMs || 60_000;
+    if (sinceOnline < grace) {
+      const secsLeft = Math.ceil((grace - sinceOnline) / 1000);
+      return `online-grace (${secsLeft}s remaining — letting Roam's sync queue drain)`;
+    }
+    return null;
+  }
+
+  function setupNetworkListeners() {
+    if (state.onlineHandler) return; // already bound
+    state.networkOnline = (typeof navigator !== "undefined" && typeof navigator.onLine === "boolean")
+      ? navigator.onLine : true;
+    state.onlineHandler = () => {
+      state.networkOnline = true;
+      state.networkOnlineSince = Date.now();
+      log("info", `network online — resuming after ${(state.settings.pauseGraceMs || 60_000) / 1000}s grace`);
+    };
+    state.offlineHandler = () => {
+      state.networkOnline = false;
+      log("warn", "network offline — pausing LLM calls + scans + writes until reconnect");
+    };
+    window.addEventListener("online", state.onlineHandler);
+    window.addEventListener("offline", state.offlineHandler);
+  }
+
+  function teardownNetworkListeners() {
+    if (state.onlineHandler) {
+      try { window.removeEventListener("online", state.onlineHandler); } catch {}
+      state.onlineHandler = null;
+    }
+    if (state.offlineHandler) {
+      try { window.removeEventListener("offline", state.offlineHandler); } catch {}
+      state.offlineHandler = null;
+    }
+  }
+
   /* ---------- core processor ---------- */
   async function processBlock(uid) {
     state.pending.delete(uid);
     if (state.processedToday.has(uid)) return;
+    // v1.8.1: bail early if we're paused (network or manual). The TODO
+    // stays out of processedToday so it's retried on the next scan after
+    // pause clears.
+    const why = pauseReason();
+    if (why) {
+      log("debug", `[${uid}] skipped — ${why}`);
+      return;
+    }
 
     const data = getBlock(uid);
     if (!data) return;
@@ -2499,6 +2604,15 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
   function startScan() {
     state.scanTimer = setInterval(() => {
       if (!state.settings.enabled) return;
+      // v1.8.1: skip the entire scan cycle while paused. The setting-reload,
+      // hub-sync, log-prune, and embedding-refresh all WRITE to Roam — they
+      // were a bigger contributor to work-network sync pressure than the
+      // attribution itself when the queue was already saturated.
+      const why = pauseReason();
+      if (why) {
+        log("debug", `scan cycle skipped — ${why}`);
+        return;
+      }
       if (state.settings.syncHubOnScan) {
         syncActiveProjectsHub().catch(e => log("warn", "hub sync failed", e));
       }
@@ -2950,6 +3064,12 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
         `  ${onOff(state.settings.logGroupByDay)} group log entries by day`,
         `  ${onOff(state.settings.followBlockRefs)} follow ((uid)) block-refs in TODOs`,
         ``,
+        `── pause status (v1.8.1) ──`,
+        `  Network: ${state.networkOnline ? "ONLINE" : "OFFLINE"}`,
+        `  Manual pause: ${state.manualPauseUntil > Date.now() ? `until ${new Date(state.manualPauseUntil).toLocaleTimeString()}` : "off"}`,
+        `  Effective: ${pauseReason() || "running normally"}`,
+        `  Scan interval: ${(state.settings.scanIntervalMs / 60_000).toFixed(0)} min`,
+        ``,
         `── log housekeeping ──`,
         `  Retention: ${state.settings.logRetentionDays} days`,
         `  Last prune: ${state.lastLogPruneAt ? new Date(state.lastLogPruneAt).toISOString().slice(0,16).replace("T"," ") : "never (this session)"}`,
@@ -3003,6 +3123,21 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
       try { cleanup(); } catch (e) { log("warn", "cleanup err", e); }
       log("info", "EMERGENCY STOP — disabled, scan + pullwatch killed for this tab. Refresh page to restart.");
     });
+    add("Auto-Attribute: pause for 30 min (work-network mode)", () => {
+      const dur = state.settings.manualPauseDurationMs || 30 * 60_000;
+      state.manualPauseUntil = Date.now() + dur;
+      const until = new Date(state.manualPauseUntil).toLocaleTimeString();
+      log("info", `paused until ${until} — no LLM calls, scans, or BT_attr writes`);
+      try { alert(`Auto-Attribute paused until ${until}.\n\nDuring pause: scans skip, queued debounce timers do not fire, no LLM calls, no BT_attr writes. Pull-watch still records new TODOs but they queue for after pause.\n\nResume early via "Auto-Attribute: resume now".`); } catch {}
+    });
+    add("Auto-Attribute: resume now (clear manual pause)", () => {
+      const wasPaused = state.manualPauseUntil > Date.now();
+      state.manualPauseUntil = 0;
+      // Treat resume as if just-came-online so the grace period applies — gives
+      // Roam's queue a moment before we add fresh attribution writes.
+      state.networkOnlineSince = Date.now();
+      log("info", wasPaused ? "manual pause cleared — resuming after grace period" : "(was not paused; nothing to resume)");
+    });
     add("Auto-Attribute: clear processedToday cache (allow re-process)", () => {
       state.processedToday = new Set();
       persistProcessed();
@@ -3054,6 +3189,7 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
       .then(() => loadAllSettingsFromGraph())
       .catch(e => log("warn", "settings page bootstrap failed", e?.message || e));
     registerCommands();
+    setupNetworkListeners();  // v1.8.1: pause on offline, resume after grace
     startPullWatch();
     startScan();
     // Initial hub sync (best-effort, non-blocking)
@@ -3073,6 +3209,7 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
   function cleanup() {
     if (state.scanTimer) clearInterval(state.scanTimer);
     if (state.pullWatchUnsub) try { state.pullWatchUnsub(); } catch {}
+    teardownNetworkListeners();  // v1.8.1
     for (const t of state.pending.values()) clearTimeout(t);
     state.pending.clear();
     // Unwatch correction watchers
