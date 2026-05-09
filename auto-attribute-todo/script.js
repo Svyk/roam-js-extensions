@@ -1,4 +1,21 @@
-/* auto-attribute-todo v1.8.3
+/* auto-attribute-todo v1.8.4
+ *
+ * v1.8.4 — Off-hours-write attribution gap. Failure case (Roam task
+ *   ((SduPiN4v7)) / fix block ((96K0Ncq3l))): deep-dream's 03:00
+ *   LaunchAgent wrote `{{[[TODO]]}} review-queue: 6 pending | ...` via
+ *   the Roam Alpha API. Auto-attribute didn't fire because (a) the
+ *   pull-watch only triggers when the Roam tab is loaded — wasn't, at
+ *   3 AM; (b) the periodic scan also only runs while the tab is loaded.
+ *   When the user opened Roam ~10 AM the first scan was up to 30 min
+ *   later (per v1.8.3) AND `scanBudgetPerCycle: 10` would have dribbled
+ *   any backlog of >10 TODOs out across multiple cycles. Fix: on init(),
+ *   after settings load, run a one-shot `runScanCycle({ unbounded: true })`
+ *   that queues the entire missing-BT_attrProject backlog with no budget
+ *   cap. The downstream LLM dispatcher + pause-on-network logic still
+ *   rate-limits actual API calls, so "no cap" only affects how many
+ *   blocks enter the queue — not how fast they leave it. Item 8b
+ *   (cross-session `processedToday` persistence) was already shipped as
+ *   `loadProcessed`/`persistProcessed` localStorage keyed by date.
  *
  * v1.8.3 — Scan interval compromise: 60min → 30min. The v1.8.2 quartering
  *   was based on a misdiagnosis of the sync failure mode (assumed outbound
@@ -329,7 +346,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.8.3";
+  const VERSION = "1.8.4";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -2611,6 +2628,46 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
   }
 
   /* ---------- watchers ---------- */
+  /* v1.8.4: scan-loop body extracted so init() can also call it once on
+   * startup with `unbounded: true` to drain the off-hours backlog (item 8a
+   * from `((96K0Ncq3l))`). When auto-attribute-todo isn't loaded — Roam tab
+   * closed, or the script disabled — TODOs written via the Alpha API
+   * (deep-dream LaunchAgent, scheduled scripts, etc.) accumulate without
+   * BT_attr children. The first time the script comes online for the day
+   * we want to drain that whole backlog at once, not one budget-cap per
+   * 60-min cycle. `unbounded: true` skips the budget check; the periodic
+   * timer keeps `unbounded: false` so live runtime stays bounded. */
+  function runScanCycle({ unbounded = false, label = "scan" } = {}) {
+    if (!state.settings.enabled) return 0;
+    const why = pauseReason();
+    if (why) {
+      log("debug", `${label} cycle skipped — ${why}`);
+      return 0;
+    }
+    const uids = findAllTodos();
+    let queued = 0;
+    const budget = state.settings.scanBudgetPerCycle;
+    for (const uid of uids) {
+      if (!unbounded && queued >= budget) break;
+      if (state.processedToday.has(uid)) continue;
+      if (state.pending.has(uid)) continue;
+      const data = getBlock(uid);
+      if (!data) continue;
+      if (hasBTProject(data)) {
+        state.processedToday.add(uid);
+        continue;
+      }
+      if ((data[":block/string"] || "").length < state.settings.minTextLength) continue;
+      schedule(uid);
+      queued++;
+    }
+    if (queued > 0) {
+      const cap = unbounded ? "no cap" : `${budget}`;
+      log("info", `${label} queued ${queued} (cap: ${cap})`);
+    }
+    return queued;
+  }
+
   function startScan() {
     state.scanTimer = setInterval(() => {
       if (!state.settings.enabled) return;
@@ -2618,11 +2675,7 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
       // hub-sync, log-prune, and embedding-refresh all WRITE to Roam — they
       // were a bigger contributor to work-network sync pressure than the
       // attribution itself when the queue was already saturated.
-      const why = pauseReason();
-      if (why) {
-        log("debug", `scan cycle skipped — ${why}`);
-        return;
-      }
+      if (pauseReason()) return;  // runScanCycle also checks; this short-circuits the writes below
       if (state.settings.syncHubOnScan) {
         syncActiveProjectsHub().catch(e => log("warn", "hub sync failed", e));
       }
@@ -2632,24 +2685,7 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
       refreshEmbeddingsIfStale().catch(e => log("warn", "embed refresh failed", e?.message || e));
       // v1.8.0: prune log page once per day per session
       maybePruneLog().catch(e => log("debug", "scan-prune skipped", e?.message || e));
-      const uids = findAllTodos();
-      let queued = 0;
-      const budget = state.settings.scanBudgetPerCycle;
-      for (const uid of uids) {
-        if (queued >= budget) break;
-        if (state.processedToday.has(uid)) continue;
-        if (state.pending.has(uid)) continue;
-        const data = getBlock(uid);
-        if (!data) continue;
-        if (hasBTProject(data)) {
-          state.processedToday.add(uid);
-          continue;
-        }
-        if ((data[":block/string"] || "").length < state.settings.minTextLength) continue;
-        schedule(uid);
-        queued++;
-      }
-      if (queued > 0) log("info", `scan queued ${queued}/${budget}`);
+      runScanCycle({ unbounded: false, label: "scan" });
     }, state.settings.scanIntervalMs);
   }
 
@@ -3197,7 +3233,15 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     // over localStorage if they disagree — page is source of truth.
     ensureSettingsPage(false)
       .then(() => loadAllSettingsFromGraph())
-      .catch(e => log("warn", "settings page bootstrap failed", e?.message || e));
+      // v1.8.4 (item 8a): drain the off-hours backlog once on init. TODOs
+      // written via the Alpha API while the Roam tab was closed (e.g.
+      // deep-dream's 03:00 LaunchAgent) wouldn't be touched until the
+      // first scheduled scan cycle fires — and even then `scanBudgetPerCycle`
+      // would dribble them out one cap per cycle. `unbounded: true` queues
+      // the whole backlog at once; the per-block scheduler is still rate-
+      // limited downstream by the LLM dispatcher and pause-on-network logic.
+      .then(() => runScanCycle({ unbounded: true, label: "startup-catchup" }))
+      .catch(e => log("warn", "settings page bootstrap or catchup failed", e?.message || e));
     registerCommands();
     setupNetworkListeners();  // v1.8.1: pause on offline, resume after grace
     startPullWatch();
