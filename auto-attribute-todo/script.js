@@ -1,4 +1,21 @@
-/* auto-attribute-todo v1.8.4
+/* auto-attribute-todo v1.8.5
+ *
+ * v1.8.5 — Hotfix: 60-second post-reload blackout window. Failure case
+ *   (Roam block ((0sN1hc9QR))): user reloaded v1.8.4, immediately
+ *   typed a fresh `{{[[TODO]]}}` on today's daily page, no
+ *   attribution fired. Root cause: line 424 of the state initializer
+ *   set `networkOnlineSince: Date.now()` at every IIFE init. Combined
+ *   with the v1.8.1 `pauseReason()` "online-grace" check (which bails
+ *   when `Date.now() - state.networkOnlineSince < pauseGraceMs`,
+ *   default 60s), this meant EVERY script reload silently skipped
+ *   the v1.8.4 catch-up scan and any pull-watch fires for the first
+ *   60 seconds after reload. The grace was designed for offline→online
+ *   transitions (let Roam's sync queue drain after reconnect) — it
+ *   shouldn't apply at initial script load, where there's no
+ *   transition. Fix: `networkOnlineSince: 0` at init. The `online`
+ *   event handler and "Auto-Attribute: resume now" cmd-palette
+ *   resume both still set `Date.now()` explicitly when grace is
+ *   genuinely warranted.
  *
  * v1.8.4 — Off-hours-write attribution gap. Failure case (Roam task
  *   ((SduPiN4v7)) / fix block ((96K0Ncq3l))): deep-dream's 03:00
@@ -346,7 +363,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.8.4";
+  const VERSION = "1.8.5";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -421,7 +438,15 @@
     embedsBootstrapped: false,
     // ── v1.8.1 pause state ────────────────────────────────────────────────
     networkOnline: true,          // mirrors navigator.onLine; flipped by online/offline events
-    networkOnlineSince: Date.now(), // when we last came online (for grace period)
+    // v1.8.5: was Date.now() — that triggered a 60-second `pauseReason()`
+    // "online-grace" window on every script reload, so the v1.8.4 catch-up
+    // scan and any pull-watch fires during the first 60s would bail.
+    // The grace is meant ONLY for offline→online transitions (give Roam's
+    // sync queue time to drain after reconnect) — it shouldn't apply at
+    // initial script load, when there's no transition. Initialize to 0;
+    // the `online` event handler and the manual-resume cmd palette both
+    // set Date.now() explicitly when grace is genuinely warranted.
+    networkOnlineSince: 0,
     manualPauseUntil: 0,          // ms timestamp; 0 = no manual pause
     onlineHandler: null,          // bound listener for cleanup
     offlineHandler: null,
