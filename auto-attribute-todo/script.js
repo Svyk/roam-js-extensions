@@ -1,4 +1,31 @@
-/* auto-attribute-todo v1.8.7
+/* auto-attribute-todo v1.8.8
+ *
+ * v1.8.8 — Hotfix: master-switch-after-long-off-period unleashed
+ *   simultaneous storm. Failure case (Roam, May 10 evening): user's
+ *   `enabled` master switch had been OFF for an extended period →
+ *   silent backlog of unattributed TODOs accumulated. Flipped ON
+ *   in the cmd palette + invoked v1.8.7's "rescue backlog" → the
+ *   unbounded `findAllTodos()` queued every backlog item via
+ *   `schedule(uid)`, all with the same `debounceMs` (5s default).
+ *   ~5 seconds later, dozens of `processBlock` ran in parallel →
+ *   dozens of simultaneous LiveAI calls + Roam BT_attr writes →
+ *   Roam's sync queue saturated → graph hung; user couldn't even
+ *   open the cmd palette to disable.
+ *
+ *   Three changes:
+ *   (1) Stagger. `schedule(uid, extraDelayMs)` takes an extra delay
+ *       so the catchup/rescue can offset each item. Periodic scan
+ *       stays unstaggered (budget keeps batch small). Default
+ *       `catchupStaggerMs: 250` → ~4 attributions/sec → 100 items
+ *       in 25s instead of ~0s. Pull-watch on live typing still has
+ *       extraDelayMs=0; per-block latency stays low.
+ *   (2) Confirmation prompt. Pre-count eligible backlog. If
+ *       `unbounded` AND `eligible > catchupConfirmAbove` (default
+ *       30), `window.confirm()` with cost + duration estimate
+ *       BEFORE clearing processedToday or queuing anything. User
+ *       can Cancel to abort. The catchup-on-init path also asks.
+ *   (3) Same in the rescue cmd-palette: pre-count, prompt, then
+ *       stagger.
  *
  * v1.8.7 — Two changes addressing "TODO never attributed" failure mode
  *   (Roam block ((ulEJoZC0R)) "Plan out EMP swabs today" still failing
@@ -398,7 +425,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.8.7";
+  const VERSION = "1.8.8";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -411,6 +438,8 @@
     dailyCallCap: 100,
     scanIntervalMs: 30 * 60_000,  // v1.8.3: 60 min → 30 min compromise. v1.8.2 went 15→60 to reduce write pressure, but the actual sync failure mode turned out to be INBOUND apply lag (nautilus reactive reads, retired 2026-05-07), not outbound writes. 30 min keeps the lower-write benefit without delaying new-TODO attribution by up to an hour.
     scanBudgetPerCycle: 10,
+    catchupStaggerMs: 250,  // v1.8.8: ms between successive processBlock fires during unbounded catchup. 250 → ~4/sec → 100 items finish in 25s. Periodic scans don't stagger (budget keeps batch small).
+    catchupConfirmAbove: 30,  // v1.8.8: if unbounded scan finds > N items, prompt before queuing. Prevents accidental storms (e.g. master-switch flipped on after long off-period). 0 = never prompt.
     // v1.8.1 — pause-on-network-pressure: when the browser reports offline,
     // OR the user manually pauses (cmd palette), suppress all LLM calls,
     // scans, and BT_attr writes. Resume after `pauseGraceMs` of being back
@@ -2705,9 +2734,14 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     }
   }
 
-  function schedule(uid) {
+  // v1.8.8: optional extraDelayMs lets the catchup + manual scans stagger
+  // queued processBlock calls so they don't all fire simultaneously and
+  // saturate Roam's sync queue. Live pull-watch fires keep extraDelayMs=0
+  // (single-block latency stays low). Catchup with N items passes
+  // n * staggerMs so item-100 fires ~20s after item-1 instead of 0s.
+  function schedule(uid, extraDelayMs = 0) {
     if (state.pending.has(uid)) clearTimeout(state.pending.get(uid));
-    const timer = setTimeout(() => processBlock(uid), state.settings.debounceMs);
+    const timer = setTimeout(() => processBlock(uid), state.settings.debounceMs + extraDelayMs);
     state.pending.set(uid, timer);
   }
 
@@ -2732,8 +2766,44 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     // Periodic scan stays capped — pull-watch + 30-min throttle handle live
     // attribution; the catchup is what rescues anything they both missed.
     const uids = findAllTodos({ limit: unbounded ? Infinity : 25 });
+    // v1.8.8: pre-count actual backlog (after filtering out already-processed
+    // + already-has-BT_attrProject). When > catchupConfirmAbove and unbounded,
+    // prompt the user before queuing — prevents accidental storms when
+    // master-switch-after-long-off-period unleashes hundreds of items.
+    if (unbounded && state.settings.catchupConfirmAbove > 0) {
+      let backlog = 0;
+      for (const uid of uids) {
+        if (state.processedToday.has(uid)) continue;
+        if (state.pending.has(uid)) continue;
+        const d = getBlock(uid);
+        if (!d) continue;
+        if (hasBTProject(d)) continue;
+        if ((d[":block/string"] || "").length < state.settings.minTextLength) continue;
+        backlog++;
+      }
+      if (backlog > state.settings.catchupConfirmAbove) {
+        const staggerSec = Math.ceil((backlog * (state.settings.catchupStaggerMs || 250)) / 1000);
+        const proceed = window.confirm(
+          `Auto-Attribute ${label}: ${backlog} unattributed TODOs found.\n\n` +
+          `This will fire ${backlog} LLM calls (~${(backlog * 0.005).toFixed(2)}-${(backlog * 0.02).toFixed(2)} USD on LiveAI's tier) and write ${backlog} sets of BT_attr children, spread over ~${staggerSec}s.\n\n` +
+          `OK to proceed, Cancel to skip. (If unsure, click Cancel — you can run "Auto-Attribute: rescue backlog" later from the cmd palette.)`
+        );
+        if (!proceed) {
+          log("info", `${label} cancelled by user — ${backlog} items deferred`);
+          return 0;
+        }
+      }
+    }
     let queued = 0;
     const budget = state.settings.scanBudgetPerCycle;
+    // v1.8.8: stagger unbounded queues so they don't all fire simultaneously.
+    // Failure case: master switch was OFF for weeks, then flipped ON — catchup
+    // queued ~hundreds of TODOs which all hit `processBlock` after the same
+    // debounceMs (5s default). Hundreds of parallel LLM calls + BT_attr writes
+    // → Roam sync queue saturated → graph hangs. Stagger spreads them: item-0
+    // at debounceMs, item-100 at debounceMs + 100*staggerMs = 25s. Periodic
+    // scan stays no-stagger (budget keeps batch size sane on its own).
+    const staggerMs = unbounded ? (state.settings.catchupStaggerMs || 250) : 0;
     for (const uid of uids) {
       if (!unbounded && queued >= budget) break;
       if (state.processedToday.has(uid)) continue;
@@ -2745,12 +2815,13 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
         continue;
       }
       if ((data[":block/string"] || "").length < state.settings.minTextLength) continue;
-      schedule(uid);
+      schedule(uid, queued * staggerMs);
       queued++;
     }
     if (queued > 0) {
       const cap = unbounded ? "no cap" : `${budget}`;
-      log("info", `${label} queued ${queued} (cap: ${cap})`);
+      const spread = staggerMs ? `, spread over ${Math.ceil((queued * staggerMs) / 1000)}s` : "";
+      log("info", `${label} queued ${queued} (cap: ${cap}${spread})`);
     }
     return queued;
   }
@@ -3282,20 +3353,37 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     // you don't know whether it's stuck in processedToday or fell out of the
     // top-25 edit-time window. Equivalent to: clear cache, then scan no-cap.
     add("Auto-Attribute: rescue backlog (force-process all unattributed)", () => {
-      state.processedToday = new Set();
-      persistProcessed();
       const uids = findAllTodos({ limit: Infinity });
-      let queued = 0;
+      // v1.8.8: pre-count + confirm before clearing processedToday + queuing.
+      // The May 10 incident: enabling master switch after long off-period
+      // unleashed all backlog simultaneously and saturated Roam's sync queue.
+      const eligible = [];
       for (const uid of uids) {
         const data = getBlock(uid);
         if (!data || hasBTProject(data)) continue;
         if ((data[":block/string"] || "").length < state.settings.minTextLength) continue;
-        const exclusionReason = isExcludedFromAttribution(uid, data[":block/string"] || "");
-        if (exclusionReason) continue;
-        schedule(uid);
+        if (isExcludedFromAttribution(uid, data[":block/string"] || "")) continue;
+        eligible.push(uid);
+      }
+      const staggerMs = state.settings.catchupStaggerMs || 250;
+      const totalSec = Math.ceil((eligible.length * staggerMs) / 1000);
+      const proceed = eligible.length === 0 || window.confirm(
+        `Auto-Attribute rescue: ${eligible.length} unattributed TODOs found.\n\n` +
+        `Will fire ${eligible.length} LLM calls (~${(eligible.length * 0.005).toFixed(2)}-${(eligible.length * 0.02).toFixed(2)} USD on LiveAI tier) and write ${eligible.length} sets of BT_attr children, staggered ${staggerMs}ms apart (~${totalSec}s total).\n\n` +
+        `OK to proceed, Cancel to abort. processedToday cache will be cleared either way.`
+      );
+      state.processedToday = new Set();
+      persistProcessed();
+      if (!proceed) {
+        log("info", `rescue cancelled — processedToday cleared but no items queued`);
+        return;
+      }
+      let queued = 0;
+      for (const uid of eligible) {
+        schedule(uid, queued * staggerMs);
         queued++;
       }
-      const msg = `rescue queued ${queued} unattributed TODOs (no cap, no processedToday filter)`;
+      const msg = `rescue queued ${queued} unattributed TODOs over ~${totalSec}s`;
       log("info", msg);
       try { alert(msg); } catch {}
     });
