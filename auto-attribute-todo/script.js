@@ -1,4 +1,24 @@
-/* auto-attribute-todo v1.8.6
+/* auto-attribute-todo v1.8.7
+ *
+ * v1.8.7 — Two changes addressing "TODO never attributed" failure mode
+ *   (Roam block ((ulEJoZC0R)) "Plan out EMP swabs today" still failing
+ *   on May 10 after v1.8.6 shipped):
+ *   (1) `processBlock` line 2604 adds the UID to `processedToday` BEFORE
+ *       the LLM call as an anti-loop guard (v1.0.3 pattern). But the
+ *       failure paths — `attribute()` returns null (LiveAI hiccup,
+ *       transient API error) and `insertAttrs()` throws (Roam sync
+ *       error) — left the UID in `processedToday`. Once persisted to
+ *       localStorage by `persistProcessed()`, the block was permanently
+ *       skipped for the rest of the day even across script reloads.
+ *       Fix: remove from `processedToday` on those two transient
+ *       failure paths so the next scan retries. Race-skipped and
+ *       suggestion-only paths intentionally stay — those are successful
+ *       terminations, not failures.
+ *   (2) New cmd-palette: "Auto-Attribute: rescue backlog (force-process
+ *       all unattributed)". One button that clears `processedToday` AND
+ *       runs an unbounded scan. Use when a TODO won't attribute and the
+ *       cause is ambiguous (stuck in cache vs fell out of 25-window vs
+ *       earlier transient failure).
  *
  * v1.8.6 — `findAllTodos()` 25-cap was silently capping the v1.8.4
  *   "unbounded catch-up scan" — the budget bypass in `runScanCycle`
@@ -378,7 +398,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.8.6";
+  const VERSION = "1.8.7";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -2625,6 +2645,9 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
         } catch (e) {
           log("error", `[${uid}] page-context insert failed`, e);
           await logToRoam(uid, adoptedAttrs, e.message);
+          // v1.8.7: transient failure → retry on next scan instead of locking.
+          state.processedToday.delete(uid);
+          persistProcessed();
         }
         return;
       }
@@ -2633,6 +2656,17 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     const attrs = await attribute(uid, text);
     if (!attrs) {
       await logToRoam(uid, null, "no result");
+      // v1.8.7: a null LLM result is a transient failure (rate limit, network
+      // blip, LiveAI hiccup). Removing from processedToday lets the next scan
+      // retry — the anti-loop protection in line 2604 already prevented same-
+      // cycle reentry. Without this, a single null-result locks the block into
+      // permanent skip for the rest of the day, even across script reloads
+      // (loadProcessed restores from localStorage). Failure case: TODOs that
+      // hit a momentary LLM glitch never get attributed without manual
+      // intervention. The race-skipped + suggestion-only paths intentionally
+      // stay in processedToday — those are successful terminations.
+      state.processedToday.delete(uid);
+      persistProcessed();
       return;
     }
     // Auto-create project if AI returned null project but suggested a new one
@@ -2663,6 +2697,11 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     } catch (e) {
       log("error", `insert failed (${uid})`, e);
       await logToRoam(uid, attrs, e.message);
+      // v1.8.7: insertAttrs throws are transient too (Roam sync error, network
+      // timeout writing the children, etc.). Same reasoning as above — remove
+      // from processedToday so the next scan retries instead of locking out.
+      state.processedToday.delete(uid);
+      persistProcessed();
     }
   }
 
@@ -3237,6 +3276,28 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
       state.processedToday = new Set();
       persistProcessed();
       log("info", "processedToday cleared — next scan will re-evaluate everything (within budget)");
+    });
+    // v1.8.7: one-button rescue. Combines "clear processedToday" + "scan now"
+    // with unbounded findAllTodos. Use when an old TODO won't attribute and
+    // you don't know whether it's stuck in processedToday or fell out of the
+    // top-25 edit-time window. Equivalent to: clear cache, then scan no-cap.
+    add("Auto-Attribute: rescue backlog (force-process all unattributed)", () => {
+      state.processedToday = new Set();
+      persistProcessed();
+      const uids = findAllTodos({ limit: Infinity });
+      let queued = 0;
+      for (const uid of uids) {
+        const data = getBlock(uid);
+        if (!data || hasBTProject(data)) continue;
+        if ((data[":block/string"] || "").length < state.settings.minTextLength) continue;
+        const exclusionReason = isExcludedFromAttribution(uid, data[":block/string"] || "");
+        if (exclusionReason) continue;
+        schedule(uid);
+        queued++;
+      }
+      const msg = `rescue queued ${queued} unattributed TODOs (no cap, no processedToday filter)`;
+      log("info", msg);
+      try { alert(msg); } catch {}
     });
     add("Auto-Attribute: show active projects + aliases (debug)", () => {
       const data = getActiveProjectsWithAliases();
