@@ -1,4 +1,16 @@
-/* auto-attribute-todo v1.8.8
+/* auto-attribute-todo v1.8.9
+ *
+ * v1.8.9 — Explicit template-page exclusion. `roam/templates` and
+ *   `roam/js/smartblocks/workflows` were already caught by the
+ *   `startsWith("roam/")` filter in both `isExcludedFromAttribution`
+ *   and the `findAllTodos` datalog. v1.8.9 adds a user-editable
+ *   `templatePages` setting (graph key `template_pages::`,
+ *   comma-separated) so users whose template/workflow pages live
+ *   OUTSIDE the `roam/` namespace can name them by title and have
+ *   their TODOs ignored. Default value lists the two `roam/*` ones
+ *   explicitly for clarity. Also added `"csv"` type to the settings
+ *   parser so comma-separated lists round-trip cleanly between the
+ *   graph (string form) and runtime (array form).
  *
  * v1.8.8 — Hotfix: master-switch-after-long-off-period unleashed
  *   simultaneous storm. Failure case (Roam, May 10 evening): user's
@@ -425,7 +437,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.8.8";
+  const VERSION = "1.8.9";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -447,6 +459,15 @@
     pauseGraceMs: 60_000,         // wait 60s after coming back online before resuming
     manualPauseDurationMs: 30 * 60_000, // 30 min default for manual pause cmd
     contextPages: ["Time Block Constraints", "Chief of Staff/Memory"],
+    // v1.8.9: pages whose blocks must NEVER be auto-attributed even if they
+    // contain `{{[[TODO]]}}`. Default includes `roam/templates` and
+    // `roam/js/smartblocks/workflows` per user request 2026-05-11. Those two
+    // are already caught by the `startsWith("roam/")` filter in
+    // isExcludedFromAttribution + the datalog query in findAllTodos — listing
+    // them by name is belt-and-suspenders + lets non-roam/-prefixed template
+    // pages (e.g. user-named "Templates" or "SmartBlocks Workflows") be added
+    // via the graph setting `template_pages::`.
+    templatePages: ["roam/templates", "roam/js/smartblocks/workflows"],
     requireConfirmation: false,
     aliasKeyword: "Aliases",
     contextPathDepth: 5,
@@ -572,6 +593,8 @@
     ["block_ref_max_follow",   "blockRefMaxFollow",      "int",    5,     "Max number of ((uid)) refs to resolve per TODO. Safety cap."],
     // v1.8.1: page-context project adoption
     ["adopt_active_project_page", "adoptActiveProjectPage", "bool", true, "When the TODO is on a page that itself has 'Project Status:: Active' (or 'Ongoing'), adopt that page as BT_attrProject without calling the LLM. Skips daily pages, roam/* system pages, the hub/log/settings/corrections pages, and pages with Project Status:: Archive. Off = pure LLM flow regardless of page context."],
+    // v1.8.9: explicit template-page exclusion
+    ["template_pages",         "templatePages",          "csv",    "roam/templates, roam/js/smartblocks/workflows", "Comma-separated page titles whose blocks must never be auto-attributed even if they contain {{[[TODO]]}}. Default includes roam/templates (Roam's built-in template page) and roam/js/smartblocks/workflows. Add custom workflow / template page names here (e.g. 'Templates, SmartBlocks Workflows') if yours live outside the roam/ namespace. The roam/* prefix is already excluded globally — this list adds extra named pages on top."],
   ];
 
   // === SETTINGS-PAGE LIB START v1.0.0 === (synced from _lib/settings-page.js)
@@ -613,11 +636,18 @@
       }
       if (type === "int") { const n = parseInt(s, 10); return Number.isFinite(n) ? n : null; }
       if (type === "float") { const n = parseFloat(s); return Number.isFinite(n) ? n : null; }
+      // v1.8.9: comma-separated list of strings → array. Trims each item, drops
+      // empties. Empty input returns []. Used for template_pages and any
+      // future multi-string setting that would otherwise need a JSON array.
+      if (type === "csv") {
+        return s ? s.split(",").map(p => p.trim()).filter(Boolean) : [];
+      }
       return s;
     }
-  
+
     function formatSettingValue(type, value) {
       if (type === "bool") return value ? "true" : "false";
+      if (type === "csv") return Array.isArray(value) ? value.join(", ") : String(value);
       return String(value);
     }
   
@@ -947,6 +977,15 @@
       if (pageTitle === SETTINGS_PAGE) return `own settings page`;
       if (pageTitle === state.settings.correctionsPage) return `corrections page`;
       if (pageTitle === state.settings.activeProjectsHub) return `hub page`;
+      // v1.8.9: explicit template-page exclusions. `roam/templates` and
+      // `roam/js/smartblocks/workflows` are already caught by the
+      // startsWith("roam/") above, but listing them by name documents
+      // intent + lets user-extendable templatePages add Templates / SmartBlocks
+      // workflow pages that DON'T live under the roam/ namespace (custom
+      // setups). Setting key: `template_pages` on [[Auto-Attribute Settings]],
+      // comma-separated page titles.
+      const templatePages = state.settings.templatePages || [];
+      if (templatePages.includes(pageTitle)) return `template page "${pageTitle}"`;
       // contextPages are read for LLM context, never written to. Real bug:
       // Time Block Constraints and Chief of Staff/Memory both got self-
       // attributed because their documentation blocks contain `{{[[TODO]]}}`
