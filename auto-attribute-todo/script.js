@@ -1,4 +1,19 @@
-/* auto-attribute-todo v1.8.5
+/* auto-attribute-todo v1.8.6
+ *
+ * v1.8.6 — `findAllTodos()` 25-cap was silently capping the v1.8.4
+ *   "unbounded catch-up scan" — the budget bypass in `runScanCycle`
+ *   didn't matter because the underlying datalog query only returned
+ *   the top-25 most-recently-edited TODOs. Failure case (Roam block
+ *   ((ulEJoZC0R)) "Plan out EMP swabs today" on May 10): older
+ *   un-attributed TODOs that fell out of the top-25 window — because
+ *   25+ newer edits buried them — were stuck forever; neither
+ *   pull-watch (missed if Roam tab wasn't focused at type-time),
+ *   nor catchup (25-cap), nor periodic scan (25-cap) could rescue
+ *   them. Fix: `findAllTodos({limit})` takes an explicit limit;
+ *   default stays 25 for the periodic-scan throttle, but the catchup
+ *   call site passes `Infinity` to drain the entire backlog. The
+ *   "Auto-Attribute: scan now" cmd-palette also upgraded to no-cap
+ *   — user-explicit invocation should not be throttled.
  *
  * v1.8.5 — Hotfix: 60-second post-reload blackout window. Failure case
  *   (Roam block ((0sN1hc9QR))): user reloaded v1.8.4, immediately
@@ -363,7 +378,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.8.5";
+  const VERSION = "1.8.6";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -1822,8 +1837,13 @@
     }
   }
 
-  function findAllTodos() {
-    // Returns recent TODOs first by block edit time. Scan-budget capped at 25.
+  function findAllTodos({ limit = 25 } = {}) {
+    // Returns TODOs sorted newest-first by block edit time. Default limit 25
+    // is the periodic-scan throttle (one cycle = one batch). v1.8.6: catchup
+    // call sites pass `{limit: Infinity}` to drain the entire backlog — the
+    // 25-cap was a silent miss for older un-attributed TODOs when 25+ newer
+    // edits buried them (failure case ((ulEJoZC0R)) on May 10).
+    //
     // v1.7.7: exclude blocks on roam/* pages at the datalog level — plugin
     // sources literally contain "{{[[TODO]]}}" in comments and would otherwise
     // be picked up and self-attributed.
@@ -1839,9 +1859,9 @@
          (not [(clojure.string/starts-with? ?t "roam/")])
          [?b :edit/time ?edit]]
       `);
-      // Sort newest first, take 25
       rows.sort((a, b) => (b[1] || 0) - (a[1] || 0));
-      return rows.slice(0, 25).map((r) => r[0]);
+      const sliced = Number.isFinite(limit) ? rows.slice(0, limit) : rows;
+      return sliced.map((r) => r[0]);
     } catch (e) {
       log("warn", "todo scan query failed", e);
       return [];
@@ -2669,7 +2689,10 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
       log("debug", `${label} cycle skipped — ${why}`);
       return 0;
     }
-    const uids = findAllTodos();
+    // v1.8.6: unbounded catchup gets the FULL todo list, not just the top 25.
+    // Periodic scan stays capped — pull-watch + 30-min throttle handle live
+    // attribution; the catchup is what rescues anything they both missed.
+    const uids = findAllTodos({ limit: unbounded ? Infinity : 25 });
     let queued = 0;
     const budget = state.settings.scanBudgetPerCycle;
     for (const uid of uids) {
@@ -3160,18 +3183,19 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
       try { alert(lines.join("\n")); } catch {}
     });
     add("Auto-Attribute: scan now", () => {
-      const uids = findAllTodos();
+      // v1.8.6: manual scan is user-explicit "do everything" — drop the
+      // 25-cap and the per-cycle budget. The user invoked this because the
+      // automatic path missed something; throttling here would defeat that.
+      const uids = findAllTodos({ limit: Infinity });
       let queued = 0;
-      const budget = state.settings.scanBudgetPerCycle;
       for (const uid of uids) {
-        if (queued >= budget) break;
         if (state.processedToday.has(uid) || state.pending.has(uid)) continue;
         const data = getBlock(uid);
         if (!data || hasBTProject(data)) continue;
         if ((data[":block/string"] || "").length < state.settings.minTextLength) continue;
         schedule(uid); queued++;
       }
-      log("info", `manual scan queued ${queued}/${budget} blocks`);
+      log("info", `manual scan queued ${queued} blocks (no cap)`);
     });
     add("Auto-Attribute: prune log page now (delete old entries)", async () => {
       // Force run regardless of session-day cooldown
