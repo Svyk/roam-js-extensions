@@ -1,4 +1,26 @@
-/* auto-attribute-todo v1.8.9
+/* auto-attribute-todo v1.8.10
+ *
+ * v1.8.10 — Deterministic relative-date stripping. Failure case
+ *   (Roam block ((kjl82B-Q0)) 2026-05-11): user wrote
+ *   "{{[[TODO]]}} Build sanitary weekly schedule this Thursday".
+ *   Auto-attribute correctly inferred BT_attrDue:: [[May 14th, 2026]],
+ *   but the title still read "this Thursday" — redundant + brittle
+ *   (the phrase will drift wrong-meaning next week). The deprecated
+ *   `cleanTodoText` LLM feature would have caught this but it was
+ *   turned off in v1.7.10 because the LLM over-stripped parens
+ *   content and #tags.
+ *
+ *   Fix: deterministic regex stripper, runs AFTER BT_attrDue is
+ *   written. Closed set of patterns:
+ *     - "(this|next|last|on) (Monday-Sunday)"
+ *     - "(today|tomorrow|yesterday|tonight)"
+ *     - "(this|next|last) (week|month|year|weekend|morning|...)"
+ *     - "(by|before|after|until|due) (the above)"
+ *   All anchored to `\s*$` (end of string) so mid-title matches like
+ *   "Schedule next week's meeting" stay alone — only trailing phrases
+ *   get stripped. Applied iteratively (capped 5 passes) so chained
+ *   tails work. New setting `strip_relative_dates::` (default true)
+ *   on the settings page; turn off to opt out.
  *
  * v1.8.9 — Explicit template-page exclusion. `roam/templates` and
  *   `roam/js/smartblocks/workflows` were already caught by the
@@ -437,7 +459,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.8.9";
+  const VERSION = "1.8.10";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -474,6 +496,7 @@
     contextChildren: true,
     contextSiblings: true,
     cleanTodoText: false,        // v1.7.10: default OFF — LLM was stripping user-typed parens content + #tags as "redundant" once BT_attrNotes/Project captured them, mutating titles in non-obvious ways. User toggle still works for opt-in.
+    stripRelativeDates: true,    // v1.8.10: deterministic regex strip of trailing relative-date phrases ("this Thursday", "today", "by next week") when BT_attrDue is set. Closed regex set, end-of-string anchored — never touches parens/tags/mid-title text. Safer than cleanTodoText; default ON.
     useDropdown: true,
     activeProjectsHub: "Active Projects",
     syncHubOnScan: true,
@@ -595,6 +618,8 @@
     ["adopt_active_project_page", "adoptActiveProjectPage", "bool", true, "When the TODO is on a page that itself has 'Project Status:: Active' (or 'Ongoing'), adopt that page as BT_attrProject without calling the LLM. Skips daily pages, roam/* system pages, the hub/log/settings/corrections pages, and pages with Project Status:: Archive. Off = pure LLM flow regardless of page context."],
     // v1.8.9: explicit template-page exclusion
     ["template_pages",         "templatePages",          "csv",    "roam/templates, roam/js/smartblocks/workflows", "Comma-separated page titles whose blocks must never be auto-attributed even if they contain {{[[TODO]]}}. Default includes roam/templates (Roam's built-in template page) and roam/js/smartblocks/workflows. Add custom workflow / template page names here (e.g. 'Templates, SmartBlocks Workflows') if yours live outside the roam/ namespace. The roam/* prefix is already excluded globally — this list adds extra named pages on top."],
+    // v1.8.10: deterministic relative-date stripping
+    ["strip_relative_dates",   "stripRelativeDates",     "bool",   true,  "Strip trailing relative-date phrases ('this Thursday', 'today', 'by next week') from the TODO title when BT_attrDue captures the absolute date. Closed regex set, end-of-string anchored — won't touch parens, tags, or mid-title text. Safer than the deprecated cleanTodoText feature. Off = leave titles as-is."],
   ];
 
   // === SETTINGS-PAGE LIB START v1.0.0 === (synced from _lib/settings-page.js)
@@ -931,6 +956,47 @@
   function hasBTProject(blockData) {
     const ch = blockData?.[":block/children"] || [];
     return ch.some((c) => (c[":block/string"] || "").startsWith("BT_attrProject::"));
+  }
+
+  /* v1.8.10: deterministic relative-date stripping. Closed regex set —
+   * never invokes the LLM, never touches parens/tags/em-dash context
+   * (unlike the deprecated `cleanTodoText` feature which over-stripped).
+   *
+   * Trigger: insertAttrs() calls this AFTER writing BT_attrDue if a
+   * relative-date phrase appears at the END of the title. The end-of-
+   * string anchor (`\s*$`) is the safety belt — mid-title matches like
+   * "Schedule next week's meeting" would risk producing "Schedule 's
+   * meeting", but "Build sanitary weekly schedule this Thursday" has the
+   * phrase at end and strips cleanly to "Build sanitary weekly schedule".
+   *
+   * Applied iteratively (capped at 5 passes) so chained tails like
+   * "review X today this week" → "review X today" → "review X" work.
+   *
+   * Failure case that motivated this: Roam block ((kjl82B-Q0)) had
+   * BT_attrDue:: [[May 14th, 2026]] inserted but title still read
+   * "Build sanitary weekly schedule this Thursday" — redundant + the
+   * relative phrase is brittle (will drift wrong meaning next week). */
+  const END_RELATIVE_DAY = /\s+\b(this|next|last|on)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b\s*$/i;
+  const END_TODAY_LIKE = /\s+\b(today|tomorrow|yesterday|tonight)\b\s*$/i;
+  const END_RELATIVE_WEEK = /\s+\b(this|next|last)\s+(week|month|year|weekend|morning|afternoon|evening|night|quarter)\b\s*$/i;
+  const END_BY_DATE = /\s+\b(by|before|after|until|due)\s+(today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|this\s+(?:week|month|weekend|morning|afternoon|evening|night)|next\s+(?:week|month|weekend|morning|afternoon|evening|night))\b\s*$/i;
+
+  function stripRelativeDatePhrases(text) {
+    let cleaned = text;
+    const stripped = [];
+    for (let pass = 0; pass < 5; pass++) {
+      let changed = false;
+      for (const re of [END_BY_DATE, END_RELATIVE_DAY, END_RELATIVE_WEEK, END_TODAY_LIKE]) {
+        const m = cleaned.match(re);
+        if (m) {
+          stripped.push(m[0].trim());
+          cleaned = cleaned.replace(re, "").trimEnd();
+          changed = true;
+        }
+      }
+      if (!changed) break;
+    }
+    return { cleaned, stripped };
   }
 
   // Filters for project page candidates
@@ -2349,6 +2415,35 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
       const btProjEntry = createdUids.find(c => c.str.startsWith("BT_attrProject::"));
       if (btProjEntry) {
         trackAttribution(btProjEntry.uid, parentUid, attrs.project, originalText);
+      }
+    }
+
+    // v1.8.10: deterministic relative-date stripping. If BT_attrDue is now on
+    // this block (either just-inserted or pre-existing), strip trailing
+    // relative-date phrases like "this Thursday" / "today" / "by next week"
+    // since the absolute date is captured separately. Closed regex set; runs
+    // BEFORE the LLM-based cleanTodoText below so the deterministic pass
+    // gets the deterministic win. Opt-out: `strip_relative_dates:: false`
+    // on the settings page.
+    if (state.settings.stripRelativeDates) {
+      const dueWasInserted = blocksToCreate.some(b => b.startsWith("BT_attrDue::"));
+      const dueAlreadyExisted = existingKeys.has("BT_attrDue");
+      if ((dueWasInserted || dueAlreadyExisted) && originalText) {
+        const { cleaned, stripped } = stripRelativeDatePhrases(originalText);
+        if (stripped.length && cleaned !== originalText) {
+          try {
+            await window.roamAlphaAPI.data.block.update({
+              block: { uid: parentUid, string: cleaned },
+            });
+            log("info", `[${parentUid}] stripped relative-date phrase(s) "${stripped.join('", "')}" — BT_attrDue covers it`);
+            // Update originalText so the downstream cleanTodoText stage (if
+            // enabled) sees the already-stripped version and doesn't try to
+            // strip the same phrase again.
+            originalText = cleaned;
+          } catch (e) {
+            log("warn", `[${parentUid}] failed to strip relative-date phrase`, e);
+          }
+        }
       }
     }
 
