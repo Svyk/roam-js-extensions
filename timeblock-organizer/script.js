@@ -1,4 +1,21 @@
-/* timeblock-organizer v1.1.5
+/* timeblock-organizer v1.1.6
+ *
+ * v1.1.6 — Expanded conflict-ignore tag list. The original v1.1.4 `#concurrent`
+ *   marker was a single-tag opt-out, but real overlaps include several
+ *   non-conflicting categories that all deserve the same treatment:
+ *     - Calendar / agenda-anchor events that already account for parallel work
+ *       (you tag them `#calendar` so the planner sees them, but they shouldn't
+ *       flag conflicts with real focus blocks)
+ *     - All-day events (`#allday` / `#all-day`) — they span the whole day by
+ *       definition and conflicting with them is meaningless
+ *     - Early-out / leaving-early markers (`#leaving-early` / `#early-out`) —
+ *       they're flags on the schedule, not conflicting time blocks
+ *   New setting `conflictIgnoreMarkers` is a comma-separated list with sensible
+ *   defaults. If EITHER block in an overlapping pair contains ANY of the
+ *   listed tags (including the existing `concurrentMarker`), the pair is
+ *   skipped in `detectOverlaps`. The existing `concurrentMarker` setting still
+ *   works (its single value is merged into the ignore list on every reconcile),
+ *   so no settings-page migration is needed for v1.1.5 users.
  *
  * v1.1.5 — Hotfix: TimeBlock parent detection broken by Nautilus retirement
  *   (Roam block ((bw1QibZxU)) on 2026-05-07). The default `timeblockSignature`
@@ -123,7 +140,7 @@
  * No LLM call. Pure Roam datalog + block.move/update. Cost: $0.
  */
 ;(function () {
-  const VERSION = "1.1.5";
+  const VERSION = "1.1.6";
   const NAMESPACE = "timeblock-organizer";
   const SETTINGS_PAGE = "TimeBlock Organizer Settings";
 
@@ -149,6 +166,7 @@
     pinnedMarker: "#pinned-time",          // items with this tag don't get bumped
     // v1.1.4
     concurrentMarker: "#concurrent",       // overlap pair where EITHER block has this tag is intentional — skip the conflict warning
+    conflictIgnoreMarkers: "#calendar, #calender, #allday, #all-day, #leaving-early, #early-out, #out-early", // v1.1.6: comma-separated additional ignore tags. Merged with `concurrentMarker` on every reconcile. Calendar/all-day/early-out events are flags on the schedule, not real conflicts.
     looseSortFallback: true,               // when strict regex fails, scan first 30 chars for HH:MM and sort by that anyway (catches in-progress edits like "19:00 " or "{{[[TODO]]}} 19:00 thing"); never rewrites the block
     untimedAtBottom: true,                 // when an entry can't be timed even loosely, park it at the BOTTOM of the TimeBlock (not the top — that was the surprise)
   };
@@ -211,6 +229,9 @@
     // v1.1.4 ──────────────────────────────────────────────────────────────────
     ["concurrent_marker",           "concurrentMarker",          "string", "#concurrent",
       "Substring/tag for blocks that may legitimately overlap. If EITHER block in an overlapping pair contains this tag, the pair is treated as intentional concurrent work and is NOT flagged in the **TimeBlock Conflicts** status block. Use when you're working on two things at once (e.g. a long meeting that runs in parallel with a flexible Plodding task)."],
+    // v1.1.6 ──────────────────────────────────────────────────────────────────
+    ["conflict_ignore_markers",     "conflictIgnoreMarkers",     "string", "#calendar, #calender, #allday, #all-day, #leaving-early, #early-out, #out-early",
+      "Comma-separated list of additional tags whose presence on EITHER block in an overlapping pair causes the pair to be skipped in conflict detection. Merged with the single `concurrent_marker` setting on every reconcile. Defaults cover calendar/agenda anchors, all-day events, and early-departure markers — none of those should flag as time conflicts with real focus blocks. Add/remove tags as needed. Leave empty to disable the multi-tag list (then only `concurrent_marker` applies)."],
     ["loose_sort_fallback",         "looseSortFallback",         "bool",   true,
       "When strict regex fails (incomplete entries like '19:00 ' with nothing after, or '{{[[TODO]]}} 19:00 thing' with the time mid-text), scan the first 30 chars for any HH:MM and sort the block by that time anyway. Never rewrites the block — sort-only. Off = old strict behavior where any non-strict block lands in the bucketed group."],
     ["untimed_at_bottom",           "untimedAtBottom",           "bool",   true,
@@ -608,7 +629,22 @@
    */
   function detectOverlaps(sortedItems) {
     const conflicts = [];
+    // v1.1.6: merge the single `concurrentMarker` with the multi-tag
+    // `conflictIgnoreMarkers` list into one set of substrings. EITHER block
+    // in an overlapping pair carrying ANY of these tags skips the conflict.
     const concurrentMarker = state.settings.concurrentMarker;
+    const ignoreList = String(state.settings.conflictIgnoreMarkers || "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean);
+    if (concurrentMarker) ignoreList.push(concurrentMarker);
+    const ignoreSet = Array.from(new Set(ignoreList));
+    const containsIgnoreTag = (str) => {
+      for (const tag of ignoreSet) {
+        if (str.includes(tag)) return true;
+      }
+      return false;
+    };
     const parsed = sortedItems
       .map(it => ({ ...it, t: parseTimePrefix(it.string) }))
       .filter(it => it.t && it.t.endMin > it.t.startMin);
@@ -617,13 +653,9 @@
       for (let j = i + 1; j < parsed.length; j++) {
         const b = parsed[j];
         if (b.t.startMin >= a.t.endMin) break; // sorted; no further overlaps with a
-        // v1.1.4: opt-out — overlap pair where EITHER block carries the
-        // concurrent marker (default `#concurrent`) is intentional
-        // (working on two things at once); skip the conflict.
-        if (concurrentMarker && (
-          a.string.includes(concurrentMarker) ||
-          b.string.includes(concurrentMarker)
-        )) continue;
+        if (ignoreSet.length && (containsIgnoreTag(a.string) || containsIgnoreTag(b.string))) {
+          continue;
+        }
         const overlapStart = Math.max(a.t.startMin, b.t.startMin);
         const overlapEnd = Math.min(a.t.endMin, b.t.endMin);
         if (overlapEnd > overlapStart) {
