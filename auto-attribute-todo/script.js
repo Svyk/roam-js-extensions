@@ -1,4 +1,35 @@
-/* auto-attribute-todo v1.8.10
+/* auto-attribute-todo v1.8.11
+ *
+ * v1.8.11 — Two changes addressing the v1.8.7 "remove from processedToday on
+ *   null result" backfire AND the v1.8.4 startup-catchup "old TODOs flood"
+ *   complaint (Roam block ((H-3kgQz8m)) "Need to disable tos auto attribute
+ *   startup-catch up it's too many todos and really old ones today"):
+ *   (1) `enableStartupCatchup` (default FALSE). v1.8.4 added an unbounded
+ *       catch-up scan on every init() to drain the off-hours backlog. In
+ *       practice this re-queues weeks-old un-attributable TODOs on every
+ *       Roam tab open, dominates the dailyCallCap, and re-tries blocks the
+ *       LLM has already declined. Opt-in only — the cmd-palette "rescue
+ *       backlog" (also added in v1.8.7) is the right surface for manual
+ *       drain when needed. Live pull-watch + periodic scan still catch
+ *       genuinely-new TODOs at the moment they're written.
+ *   (2) `maxRetriesPerDay: 3` per-UID retry budget. Failure case ((H-3kgQz8m)):
+ *       a single TODO accumulated 31 "no result" log entries over 16 hours —
+ *       one per scan interval — because v1.8.7's "remove from processedToday
+ *       on null result" treated EVERY null as transient. It isn't. Some TODOs
+ *       are legitimately unattributable: meta-tasks ("disable feature X"),
+ *       prose-heavy entries the LLM declines, blocks whose only child is an
+ *       image (the multimodal-image-URL-in-context appears to be the trigger
+ *       here — when child = `![](firebase.png.enc)` LiveAI's roamContext
+ *       pulls the encrypted URL into the prompt, and the model returns
+ *       unparseable text). Bumping a per-UID counter on every null/throw
+ *       and KEEPING the UID in processedToday once the count hits N gives
+ *       transient failures their retries (default 3) while permanently
+ *       skipping legit unattributable blocks for the rest of the day. Counter
+ *       resets at midnight along with processedToday. Persists to localStorage
+ *       alongside processedToday so script reloads don't reset the budget.
+ *
+ *   Also added: cmd-palette "show retry counts (debug)" to see which UIDs
+ *   are accumulating failures.
  *
  * v1.8.10 — Deterministic relative-date stripping. Failure case
  *   (Roam block ((kjl82B-Q0)) 2026-05-11): user wrote
@@ -459,7 +490,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.8.10";
+  const VERSION = "1.8.11";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -474,6 +505,8 @@
     scanBudgetPerCycle: 10,
     catchupStaggerMs: 250,  // v1.8.8: ms between successive processBlock fires during unbounded catchup. 250 → ~4/sec → 100 items finish in 25s. Periodic scans don't stagger (budget keeps batch small).
     catchupConfirmAbove: 30,  // v1.8.8: if unbounded scan finds > N items, prompt before queuing. Prevents accidental storms (e.g. master-switch flipped on after long off-period). 0 = never prompt.
+    enableStartupCatchup: false,  // v1.8.11: off by default. v1.8.4 ran an unbounded scan on every init() to drain off-hours backlog; in practice this re-floods the queue with old un-attributable TODOs every Roam tab open. Use cmd-palette "rescue backlog" to drain on demand.
+    maxRetriesPerDay: 3,  // v1.8.11: per-UID retry budget for null/throw failures. After N attempts in a day, UID stays locked in processedToday (permanent same-day skip). Was effectively unbounded — single block ((H-3kgQz8m)) accumulated 31 retries in 16h.
     // v1.8.1 — pause-on-network-pressure: when the browser reports offline,
     // OR the user manually pauses (cmd palette), suppress all LLM calls,
     // scans, and BT_attr writes. Resume after `pauseGraceMs` of being back
@@ -534,6 +567,11 @@
     settings: { ...DEFAULTS },
     pending: new Map(),          // uid → debounce timer
     processedToday: new Set(),
+    // v1.8.11: uid → fail count for current local day. Bumped on null LLM result
+    // or insertAttrs throw. When fails >= settings.maxRetriesPerDay, UID stays
+    // in processedToday (no delete) so the periodic scan stops re-trying.
+    // Persisted to localStorage alongside processedToday; resets at midnight.
+    failedAttemptsToday: new Map(),
     callsToday: 0,
     callsResetDate: new Date().toDateString(),
     pullWatchUnsub: null,
@@ -575,10 +613,28 @@
     } catch { return new Set(); }
   }
 
+  // v1.8.11: per-day retry-count cache (uid → fail-count). Same date-keyed
+  // shape as loadProcessed; auto-clears at midnight.
+  function loadFailedAttempts() {
+    const today = new Date().toDateString();
+    try {
+      const stored = JSON.parse(localStorage.getItem(sk("failedAttempts")) || "{}");
+      if (stored.date !== today) return new Map();
+      return new Map(stored.entries || []);
+    } catch { return new Map(); }
+  }
+
   function persistProcessed() {
+    const today = new Date().toDateString();
     localStorage.setItem(sk("processed"), JSON.stringify({
-      date: new Date().toDateString(),
+      date: today,
       uids: Array.from(state.processedToday),
+    }));
+    // v1.8.11: piggyback the retry-counter persist on every processedToday
+    // write since the two are mutated together in processBlock.
+    localStorage.setItem(sk("failedAttempts"), JSON.stringify({
+      date: today,
+      entries: Array.from(state.failedAttemptsToday.entries()),
     }));
   }
 
@@ -620,6 +676,9 @@
     ["template_pages",         "templatePages",          "csv",    "roam/templates, roam/js/smartblocks/workflows", "Comma-separated page titles whose blocks must never be auto-attributed even if they contain {{[[TODO]]}}. Default includes roam/templates (Roam's built-in template page) and roam/js/smartblocks/workflows. Add custom workflow / template page names here (e.g. 'Templates, SmartBlocks Workflows') if yours live outside the roam/ namespace. The roam/* prefix is already excluded globally — this list adds extra named pages on top."],
     // v1.8.10: deterministic relative-date stripping
     ["strip_relative_dates",   "stripRelativeDates",     "bool",   true,  "Strip trailing relative-date phrases ('this Thursday', 'today', 'by next week') from the TODO title when BT_attrDue captures the absolute date. Closed regex set, end-of-string anchored — won't touch parens, tags, or mid-title text. Safer than the deprecated cleanTodoText feature. Off = leave titles as-is."],
+    // v1.8.11: startup-catchup gating + retry budget
+    ["enable_startup_catchup", "enableStartupCatchup",   "bool",   false, "Run an unbounded scan on every script init() to drain the off-hours backlog. Default OFF since v1.8.11 — re-floods the queue with weeks-old un-attributable TODOs on every Roam reload. Use cmd-palette 'Auto-Attribute: rescue backlog' to drain manually when you actually want it."],
+    ["max_retries_per_day",    "maxRetriesPerDay",       "int",    3,     "Per-UID retry budget. After N null-LLM-result or insertAttrs-throw failures in a day, the UID stays locked in processedToday (permanent same-day skip). Prevents single un-attributable blocks from accumulating dozens of retry log entries. Resets at midnight along with processedToday."],
   ];
 
   // === SETTINGS-PAGE LIB START v1.0.0 === (synced from _lib/settings-page.js)
@@ -2805,10 +2864,22 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
         try {
           await insertAttrs(uid, adoptedAttrs, text);
           await logToRoam(uid, adoptedAttrs, null);
+          if (state.failedAttemptsToday.has(uid)) {
+            state.failedAttemptsToday.delete(uid);
+            persistProcessed();
+          }
         } catch (e) {
           log("error", `[${uid}] page-context insert failed`, e);
-          await logToRoam(uid, adoptedAttrs, e.message);
-          // v1.8.7: transient failure → retry on next scan instead of locking.
+          // v1.8.11: bounded retry — same logic as the main LLM path.
+          const fails = (state.failedAttemptsToday.get(uid) || 0) + 1;
+          state.failedAttemptsToday.set(uid, fails);
+          const cap = state.settings.maxRetriesPerDay || 3;
+          await logToRoam(uid, adoptedAttrs, `${e.message} (attempt ${fails}/${cap})`);
+          if (fails >= cap) {
+            log("warn", `[${uid}] page-context insert reached maxRetriesPerDay (${fails}) — locking out for the rest of today.`);
+            persistProcessed();
+            return;
+          }
           state.processedToday.delete(uid);
           persistProcessed();
         }
@@ -2818,16 +2889,24 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
 
     const attrs = await attribute(uid, text);
     if (!attrs) {
-      await logToRoam(uid, null, "no result");
-      // v1.8.7: a null LLM result is a transient failure (rate limit, network
-      // blip, LiveAI hiccup). Removing from processedToday lets the next scan
-      // retry — the anti-loop protection in line 2604 already prevented same-
-      // cycle reentry. Without this, a single null-result locks the block into
-      // permanent skip for the rest of the day, even across script reloads
-      // (loadProcessed restores from localStorage). Failure case: TODOs that
-      // hit a momentary LLM glitch never get attributed without manual
-      // intervention. The race-skipped + suggestion-only paths intentionally
-      // stay in processedToday — those are successful terminations.
+      // v1.8.11: per-UID retry budget. v1.8.7's blanket "delete from
+      // processedToday on null" treats every null as transient — but some
+      // TODOs are legitimately unattributable (meta-tasks, image-only
+      // children that make LiveAI return unparseable output, etc.) and would
+      // otherwise generate one log entry per scan interval indefinitely
+      // (Roam block ((H-3kgQz8m)) hit 31 fails in 16h before this fix).
+      // Bump the counter, log it, and only delete from processedToday if
+      // we haven't yet hit the budget.
+      const fails = (state.failedAttemptsToday.get(uid) || 0) + 1;
+      state.failedAttemptsToday.set(uid, fails);
+      const cap = state.settings.maxRetriesPerDay || 3;
+      await logToRoam(uid, null, `no result (attempt ${fails}/${cap})`);
+      if (fails >= cap) {
+        log("warn", `[${uid}] reached maxRetriesPerDay (${fails}) — locking out for the rest of today. Use cmd-palette "clear processedToday cache" or "rescue backlog" to retry sooner.`);
+        // Keep in processedToday — no delete. Persist the fail count.
+        persistProcessed();
+        return;
+      }
       state.processedToday.delete(uid);
       persistProcessed();
       return;
@@ -2857,12 +2936,26 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     try {
       await insertAttrs(uid, attrs, text);
       await logToRoam(uid, attrs, null);
+      // v1.8.11: success — drop any accumulated fail count so a re-edit later
+      // gets full retry budget again.
+      if (state.failedAttemptsToday.has(uid)) {
+        state.failedAttemptsToday.delete(uid);
+        persistProcessed();
+      }
     } catch (e) {
       log("error", `insert failed (${uid})`, e);
-      await logToRoam(uid, attrs, e.message);
-      // v1.8.7: insertAttrs throws are transient too (Roam sync error, network
-      // timeout writing the children, etc.). Same reasoning as above — remove
-      // from processedToday so the next scan retries instead of locking out.
+      // v1.8.11: same retry-budget logic as null-result path. Roam sync errors
+      // are usually transient (network blip, write race) but can be recurrent
+      // if the block has structural issues — bound the retries.
+      const fails = (state.failedAttemptsToday.get(uid) || 0) + 1;
+      state.failedAttemptsToday.set(uid, fails);
+      const cap = state.settings.maxRetriesPerDay || 3;
+      await logToRoam(uid, attrs, `${e.message} (attempt ${fails}/${cap})`);
+      if (fails >= cap) {
+        log("warn", `[${uid}] insertAttrs reached maxRetriesPerDay (${fails}) — locking out for the rest of today.`);
+        persistProcessed();
+        return;
+      }
       state.processedToday.delete(uid);
       persistProcessed();
     }
@@ -3479,8 +3572,31 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     });
     add("Auto-Attribute: clear processedToday cache (allow re-process)", () => {
       state.processedToday = new Set();
+      // v1.8.11: also drop retry counters so a manual clear gives every UID
+      // its full retry budget back, not just lifts the processedToday lock.
+      state.failedAttemptsToday = new Map();
       persistProcessed();
-      log("info", "processedToday cleared — next scan will re-evaluate everything (within budget)");
+      log("info", "processedToday + retry counts cleared — next scan will re-evaluate everything (within budget)");
+    });
+    // v1.8.11: surface which UIDs are accumulating null-result failures so a
+    // user can investigate (image children? meta-tasks? prompt-too-long?) before
+    // they hit maxRetriesPerDay and lock out for the rest of the day.
+    add("Auto-Attribute: show retry counts (debug)", () => {
+      const cap = state.settings.maxRetriesPerDay || 3;
+      const rows = Array.from(state.failedAttemptsToday.entries())
+        .sort((a, b) => b[1] - a[1])
+        .map(([uid, fails]) => ({
+          uid,
+          fails,
+          locked_out: fails >= cap ? "yes" : "no",
+          preview: (getBlock(uid)?.[":block/string"] || "").slice(0, 80),
+        }));
+      if (!rows.length) {
+        log("info", "no retry counts today");
+        return;
+      }
+      log("info", `retry counts (cap = ${cap}/day):`);
+      console.table(rows);
     });
     // v1.8.7: one-button rescue. Combines "clear processedToday" + "scan now"
     // with unbounded findAllTodos. Use when an old TODO won't attribute and
@@ -3507,9 +3623,11 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
         `OK to proceed, Cancel to abort. processedToday cache will be cleared either way.`
       );
       state.processedToday = new Set();
+      // v1.8.11: also clear retry counts so locked-out UIDs get full budget.
+      state.failedAttemptsToday = new Map();
       persistProcessed();
       if (!proceed) {
-        log("info", `rescue cancelled — processedToday cleared but no items queued`);
+        log("info", `rescue cancelled — processedToday + retry counts cleared but no items queued`);
         return;
       }
       let queued = 0;
@@ -3559,6 +3677,7 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
       log("info", `LiveAI default model: ${window.LiveAI_API.getDefaultModel()}`);
     }
     state.processedToday = loadProcessed();
+    state.failedAttemptsToday = loadFailedAttempts();  // v1.8.11
     loadPersistentSettings();  // Phase 3: rehydrate from localStorage cache
     // v1.7.4: bootstrap [[Auto-Attribute Settings]] page (creates missing
     // setting blocks idempotently) then load values from graph. Graph wins
@@ -3572,7 +3691,16 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
       // would dribble them out one cap per cycle. `unbounded: true` queues
       // the whole backlog at once; the per-block scheduler is still rate-
       // limited downstream by the LLM dispatcher and pause-on-network logic.
-      .then(() => runScanCycle({ unbounded: true, label: "startup-catchup" }))
+      //
+      // v1.8.11: now opt-in. User complaint ((H-3kgQz8m)) — startup-catchup
+      // floods the dailyCallCap with weeks-old un-attributable TODOs every
+      // time Roam reloads. Use cmd-palette "rescue backlog" for manual drain.
+      .then(() => {
+        if (state.settings.enableStartupCatchup) {
+          return runScanCycle({ unbounded: true, label: "startup-catchup" });
+        }
+        log("info", "startup-catchup disabled (v1.8.11 default). Use cmd-palette 'Auto-Attribute: rescue backlog' to drain backlog on demand.");
+      })
       .catch(e => log("warn", "settings page bootstrap or catchup failed", e?.message || e));
     registerCommands();
     setupNetworkListeners();  // v1.8.1: pause on offline, resume after grace
