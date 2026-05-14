@@ -1,4 +1,35 @@
-/* auto-attribute-todo v1.8.11
+/* auto-attribute-todo v1.8.12
+ *
+ * v1.8.12 — Duplicate-attribution fix. Roam block ((ywb2ifT8h)) 2026-05-13:
+ *   a single TODO ended up with two BT_attrDue, two BT_attrPriority, two
+ *   BT_attrEnergy, two BT_attrContext, and two BT_attrNotes children — one
+ *   set at conf 0.55, another at conf 0.45. Two LLM calls, both wrote a
+ *   full set.
+ *
+ *   Root cause: the pre-LLM filter at line ~2836 and the post-LLM race-window
+ *   guard at line ~2931 BOTH check only `hasBTProject(...)`. When the LLM
+ *   returns no project inference (work tasks with no inferable project page
+ *   like "edit the titration form"), no BT_attrProject is ever written —
+ *   so both guards return false on every subsequent reprocess, even though
+ *   BT_attrDue/Priority/Energy/Context/Notes are already there from the
+ *   prior attribution. The per-key dedup inside insertAttrs at line ~2434
+ *   uses `roamAlphaAPI.data.pull` which is supposed to catch this, but the
+ *   pull is non-transactional w.r.t. concurrent createBlock calls and can
+ *   return stale children when Roam's sync queue is backed up.
+ *
+ *   Fix: detect the plugin's own trail marker. insertAttrs always writes a
+ *   `BT_attrNotes:: auto-attributed...` child. Add `hasAutoAttributedNotes()`
+ *   helper next to `hasBTProject()`. Use it (OR'd with the existing
+ *   BT_attrProject check) in both the pre-LLM and post-LLM guards:
+ *     - pre-LLM: skip the LLM call entirely if the plugin already attributed
+ *       this UID (handles cross-midnight reprocess once processedToday clears)
+ *     - post-LLM (race window): skip the insert if attribution appeared during
+ *       the LLM's 5s call (concurrent runners, same UID)
+ *
+ *   The user-vs-plugin trail-marker check distinguishes plugin attribution
+ *   (BT_attrNotes value starts with "auto-attributed") from manual BT_attr
+ *   entries the user typed by hand. Manual BT_attrPriority on an otherwise-
+ *   un-attributed TODO will still let the plugin fill in BT_attrProject.
  *
  * v1.8.11 — Two changes addressing the v1.8.7 "remove from processedToday on
  *   null result" backfire AND the v1.8.4 startup-catchup "old TODOs flood"
@@ -490,7 +521,7 @@
  * robust manual parse (strips json-tagged markdown fences if present).
  */
 ;(function () {
-  const VERSION = "1.8.11";
+  const VERSION = "1.8.12";
   const NAMESPACE = "auto-attr-todo";
   const LOG_PAGE = "Auto-Attribute TODO Log";
   const SETTINGS_PAGE = "Auto-Attribute Settings";
@@ -1015,6 +1046,22 @@
   function hasBTProject(blockData) {
     const ch = blockData?.[":block/children"] || [];
     return ch.some((c) => (c[":block/string"] || "").startsWith("BT_attrProject::"));
+  }
+
+  // v1.8.12: plugin-trail-marker check. insertAttrs ALWAYS pushes a
+  // `BT_attrNotes:: auto-attributed...` child (see line ~2430). Detecting that
+  // marker reliably identifies blocks the plugin has already attributed, even
+  // when the LLM returned no project (BT_attrProject absent). Used in two
+  // guards: (a) pre-LLM filter, to avoid re-spending an LLM call on cross-
+  // midnight reprocess once processedToday clears; (b) post-LLM race-window
+  // guard, to catch concurrent runners that wrote during the LLM's 5s call.
+  // The "auto-attributed" prefix is the unique plugin signature — manual user
+  // BT_attrNotes:: entries won't start with this string.
+  function hasAutoAttributedNotes(blockData) {
+    const ch = blockData?.[":block/children"] || [];
+    return ch.some((c) =>
+      /^BT_attrNotes::\s+auto-attributed/.test(c[":block/string"] || "")
+    );
   }
 
   /* v1.8.10: deterministic relative-date stripping. Closed regex set —
@@ -2833,7 +2880,10 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     }
     if (!isTodo(text)) return;
     if (text.length < state.settings.minTextLength) return;
-    if (hasBTProject(data)) {
+    if (hasBTProject(data) || hasAutoAttributedNotes(data)) {
+      // v1.8.12: also bail when the plugin's BT_attrNotes trail marker is
+      // present but BT_attrProject isn't — i.e. a prior attribution that
+      // didn't infer a project. Prevents cross-midnight duplicate writes.
       state.processedToday.add(uid);
       persistProcessed();
       return;
@@ -2927,9 +2977,13 @@ ${entityListLines}${correctionsBlock}${referencedBlocksBlock}`;
     // v1.7.3: race-window guard. The LLM call took ~5s. In that window
     // another runner (parallel scan, ghost cmd from re-paste, pull-watch fire)
     // may have already attributed this TODO. Re-fetch and skip if so.
+    // v1.8.12: also check the BT_attrNotes trail marker. The original
+    // hasBTProject-only check missed concurrent attributions when neither
+    // run inferred a project (Roam block ((ywb2ifT8h)) duplicated all five
+    // BT_attr children because both runs saw no BT_attrProject and proceeded).
     const dataAfter = getBlock(uid);
-    if (dataAfter && hasBTProject(dataAfter)) {
-      log("info", `[${uid}] already has BT_attrProject after LLM call — skipping insert (race avoided)`);
+    if (dataAfter && (hasBTProject(dataAfter) || hasAutoAttributedNotes(dataAfter))) {
+      log("info", `[${uid}] already attributed after LLM call — skipping insert (race avoided)`);
       await logToRoam(uid, attrs, "race-skipped");
       return;
     }
