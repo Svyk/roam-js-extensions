@@ -1,0 +1,9 @@
+{
+  "name": "svyk-roam-extension-catalog",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node scripts/check-catalog.mjs && node scripts/scan-secrets.mjs"
+  }
+}

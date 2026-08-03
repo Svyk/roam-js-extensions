@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "extensions": [
+    {
+      "name": "Roam Grid",
+      "repository": "Svyk/roam-grid",
+      "installUrl": "https://svyk.github.io/roam-grid"
+    },
+    {
+      "name": "Auto Attribute",
+      "repository": "Svyk/roam-auto-attribute",
+      "installUrl": "https://svyk.github.io/roam-auto-attribute"
+    },
+    {
+      "name": "TimeBlock Organizer",
+      "repository": "Svyk/roam-timeblock-organizer",
+      "installUrl": "https://svyk.github.io/roam-timeblock-organizer"
+    },
+    {
+      "name": "Live AI Toolkit",
+      "repository": "Svyk/roam-live-ai-toolkit",
+      "installUrl": "https://svyk.github.io/roam-live-ai-toolkit"
+    },
+    {
+      "name": "Archive TODOs",
+      "repository": "Svyk/roam-archive-todos",
+      "installUrl": "https://svyk.github.io/roam-archive-todos"
+    },
+    {
+      "name": "Hide DONE",
+      "repository": "Svyk/roam-hide-done",
+      "installUrl": "https://svyk.github.io/roam-hide-done"
+    }
+  ]
+}
